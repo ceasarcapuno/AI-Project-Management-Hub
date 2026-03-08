@@ -13,7 +13,7 @@ import AuthPage from './pages/AuthPage'
 function AppShell() {
   const { user, authLoading } = useApp()
 
-  // Full-screen loading spinner while Supabase resolves session
+  // Full-screen loading spinner while JWT auth resolves
   if (authLoading) {
     return (
       <div style={{

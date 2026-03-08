@@ -1,41 +1,33 @@
 // ─── Projects Router ──────────────────────────────────────────────────────────
-// Provides full CRUD for projects plus a rich detail endpoint that joins
-// milestones, tasks, agents, and outputs.
-//
 // Mounted at: /api/projects
+// All queries filter by user_id via workspace ownership.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
+const pool    = require('../db');
 const { requireAuth } = require('../middleware/auth');
-const { getSupabaseForUser } = require('../services/supabase');
 
 const router = express.Router();
-
-// Apply auth middleware to all routes in this file
 router.use(requireAuth);
 
 // ─── GET /api/projects ────────────────────────────────────────────────────────
-// List projects for the authenticated user.
-// Optional query param: ?workspace_id=<uuid> to filter by workspace.
-// Returns projects ordered by creation date (newest first).
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { workspace_id } = req.query;
 
-    let query = supabase
-      .from('projects')
-      .select('*')
-      .order('created_at', { ascending: false });
+    let sql  = `SELECT p.* FROM projects p
+                JOIN workspaces w ON w.id = p.workspace_id
+                WHERE w.user_id = $1`;
+    const vals = [req.user.id];
 
     if (workspace_id) {
-      query = query.eq('workspace_id', workspace_id);
+      sql += ` AND p.workspace_id = $2`;
+      vals.push(workspace_id);
     }
+    sql += ' ORDER BY p.created_at DESC';
 
-    const { data, error } = await query;
-    if (error) throw error;
-
-    return res.json(data);
+    const { rows } = await pool.query(sql, vals);
+    return res.json(rows);
   } catch (err) {
     console.error('[GET /projects]', err.message);
     return res.status(500).json({ error: err.message });
@@ -43,45 +35,27 @@ router.get('/', async (req, res) => {
 });
 
 // ─── POST /api/projects ───────────────────────────────────────────────────────
-// Create a new project within a workspace.
-// Body: { workspace_id, name, goal?, status?, due_date?, tags? }
 router.post('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { workspace_id, name, goal, status = 'active', due_date, tags } = req.body;
+    const { workspace_id, name, goal, emoji, due_label, employer_note } = req.body;
 
-    if (!workspace_id) {
-      return res.status(400).json({ error: 'workspace_id is required' });
-    }
-    if (!name || typeof name !== 'string' || name.trim() === '') {
-      return res.status(400).json({ error: 'Project name is required' });
-    }
+    if (!workspace_id) return res.status(400).json({ error: 'workspace_id is required' });
+    if (!name || name.trim() === '') return res.status(400).json({ error: 'Project name is required' });
 
-    const validStatuses = ['active', 'paused', 'completed', 'archived'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
-    }
+    // Verify workspace belongs to user
+    const { rows: ws } = await pool.query(
+      'SELECT id FROM workspaces WHERE id = $1 AND user_id = $2',
+      [workspace_id, req.user.id]
+    );
+    if (!ws[0]) return res.status(403).json({ error: 'Workspace not found or access denied' });
 
-    const { data, error } = await supabase
-      .from('projects')
-      .insert({
-        workspace_id,
-        user_id: req.user.id,
-        name: name.trim(),
-        goal: goal ?? null,
-        status,
-        due_date: due_date ?? null,
-        tags: tags ?? [],
-        total_cost: 0,
-        tokens_used: 0,
-        progress: 0,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return res.status(201).json(data);
+    const { rows } = await pool.query(
+      `INSERT INTO projects (workspace_id, name, goal, emoji, due_label, employer_note)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [workspace_id, name.trim(), goal ?? null, emoji ?? null, due_label ?? null, employer_note ?? null]
+    );
+    return res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /projects]', err.message);
     return res.status(500).json({ error: err.message });
@@ -89,76 +63,36 @@ router.post('/', async (req, res) => {
 });
 
 // ─── GET /api/projects/:id ────────────────────────────────────────────────────
-// Get a single project with full context:
-//   - milestones (ordered by order_idx)
-//   - tasks (ordered by order_idx)
-//   - agents
-//   - outputs (most recent first)
-//   - recent thread messages (last 50)
 router.get('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { id } = req.params;
 
-    // Fetch the project itself
-    const { data: project, error: projectError } = await supabase
-      .from('projects')
-      .select('*')
-      .eq('id', id)
-      .single();
+    // Load project (scoped via workspace → user)
+    const { rows: pRows } = await pool.query(
+      `SELECT p.* FROM projects p
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE p.id = $1 AND w.user_id = $2`,
+      [id, req.user.id]
+    );
+    if (!pRows[0]) return res.status(404).json({ error: 'Project not found' });
+    const project = pRows[0];
 
-    if (projectError) throw projectError;
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-
-    // Fetch related data in parallel for performance
-    const [milestonesResult, tasksResult, agentsResult, outputsResult, messagesResult] = await Promise.all([
-      supabase
-        .from('milestones')
-        .select('*')
-        .eq('project_id', id)
-        .order('order_idx', { ascending: true }),
-
-      supabase
-        .from('tasks')
-        .select('*')
-        .eq('project_id', id)
-        .order('order_idx', { ascending: true }),
-
-      supabase
-        .from('agents')
-        .select('*')
-        .eq('project_id', id)
-        .order('created_at', { ascending: false }),
-
-      supabase
-        .from('outputs')
-        .select('*')
-        .eq('project_id', id)
-        .order('created_at', { ascending: false })
-        .limit(20),
-
-      supabase
-        .from('thread_messages')
-        .select('*')
-        .eq('project_id', id)
-        .order('created_at', { ascending: false })
-        .limit(50),
+    // Fetch related data in parallel
+    const [milestones, tasks, agents, outputs, messages] = await Promise.all([
+      pool.query('SELECT * FROM milestones WHERE project_id = $1 ORDER BY position ASC', [id]),
+      pool.query('SELECT * FROM tasks WHERE milestone_id IN (SELECT id FROM milestones WHERE project_id = $1) ORDER BY position ASC', [id]),
+      pool.query('SELECT * FROM agents WHERE project_id = $1 ORDER BY created_at DESC', [id]),
+      pool.query('SELECT * FROM outputs WHERE task_id IN (SELECT id FROM tasks WHERE milestone_id IN (SELECT id FROM milestones WHERE project_id = $1)) ORDER BY created_at DESC LIMIT 20', [id]),
+      pool.query('SELECT * FROM thread_messages WHERE project_id = $1 ORDER BY created_at ASC LIMIT 50', [id]),
     ]);
-
-    // Throw on any error
-    if (milestonesResult.error) throw milestonesResult.error;
-    if (tasksResult.error) throw tasksResult.error;
-    if (agentsResult.error) throw agentsResult.error;
-    if (outputsResult.error) throw outputsResult.error;
-    if (messagesResult.error) throw messagesResult.error;
 
     return res.json({
       ...project,
-      milestones: milestonesResult.data ?? [],
-      tasks: tasksResult.data ?? [],
-      agents: agentsResult.data ?? [],
-      outputs: outputsResult.data ?? [],
-      thread_messages: (messagesResult.data ?? []).reverse(), // Return chronological order
+      milestones:      milestones.rows,
+      tasks:           tasks.rows,
+      agents:          agents.rows,
+      outputs:         outputs.rows,
+      thread_messages: messages.rows,
     });
   } catch (err) {
     console.error('[GET /projects/:id]', err.message);
@@ -167,38 +101,35 @@ router.get('/:id', async (req, res) => {
 });
 
 // ─── PUT /api/projects/:id ────────────────────────────────────────────────────
-// Update a project. RLS ensures only the owner can update.
-// Body: any subset of { name, goal, status, due_date, tags, progress }
 router.put('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { id } = req.params;
-    const { name, goal, status, due_date, tags, progress, workspace_id } = req.body;
+    const { name, goal, emoji, due_label, employer_note, needs_you, token_limit } = req.body;
 
-    const updates = {};
-    if (name !== undefined) updates.name = name.trim();
-    if (goal !== undefined) updates.goal = goal;
-    if (status !== undefined) updates.status = status;
-    if (due_date !== undefined) updates.due_date = due_date;
-    if (tags !== undefined) updates.tags = tags;
-    if (progress !== undefined) updates.progress = Math.min(100, Math.max(0, Number(progress)));
-    if (workspace_id !== undefined) updates.workspace_id = workspace_id;
+    const sets = [];
+    const vals = [];
+    let   idx  = 1;
 
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No fields provided for update' });
-    }
+    if (name          !== undefined) { sets.push(`name = $${idx++}`);          vals.push(name.trim()); }
+    if (goal          !== undefined) { sets.push(`goal = $${idx++}`);          vals.push(goal); }
+    if (emoji         !== undefined) { sets.push(`emoji = $${idx++}`);         vals.push(emoji); }
+    if (due_label     !== undefined) { sets.push(`due_label = $${idx++}`);     vals.push(due_label); }
+    if (employer_note !== undefined) { sets.push(`employer_note = $${idx++}`); vals.push(employer_note); }
+    if (needs_you     !== undefined) { sets.push(`needs_you = $${idx++}`);     vals.push(JSON.stringify(needs_you)); }
+    if (token_limit   !== undefined) { sets.push(`token_limit = $${idx++}`);   vals.push(Number(token_limit)); }
 
-    const { data, error } = await supabase
-      .from('projects')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
+    if (sets.length === 0) return res.status(400).json({ error: 'No fields provided for update' });
 
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Project not found or access denied' });
-
-    return res.json(data);
+    vals.push(id, req.user.id);
+    const { rows } = await pool.query(
+      `UPDATE projects p SET ${sets.join(', ')}
+       FROM workspaces w
+       WHERE p.id = $${idx++} AND p.workspace_id = w.id AND w.user_id = $${idx}
+       RETURNING p.*`,
+      vals
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Project not found or access denied' });
+    return res.json(rows[0]);
   } catch (err) {
     console.error('[PUT /projects/:id]', err.message);
     return res.status(500).json({ error: err.message });
@@ -206,20 +137,15 @@ router.put('/:id', async (req, res) => {
 });
 
 // ─── DELETE /api/projects/:id ─────────────────────────────────────────────────
-// Delete a project and all its child data (cascades via FK constraints).
 router.delete('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
-
-    const { error } = await supabase
-      .from('projects')
-      .delete()
-      .eq('id', id);
-
-    if (error) throw error;
-
-    return res.json({ success: true, message: 'Project deleted' });
+    await pool.query(
+      `DELETE FROM projects p
+       USING workspaces w
+       WHERE p.id = $1 AND p.workspace_id = w.id AND w.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    return res.json({ success: true });
   } catch (err) {
     console.error('[DELETE /projects/:id]', err.message);
     return res.status(500).json({ error: err.message });

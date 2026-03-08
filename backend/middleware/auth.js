@@ -1,29 +1,13 @@
-// ─── Authentication Middleware ─────────────────────────────────────────────────
-// Verifies Supabase JWT tokens sent in the Authorization header.
-// On success: attaches req.user and req.token for use in route handlers.
+// ─── JWT Authentication Middleware ────────────────────────────────────────────
+// Verifies a JWT Bearer token signed with JWT_SECRET.
+// On success: attaches req.user = { id, email, name } to the request.
 // On failure: returns 401 Unauthorized.
-//
-// Usage in routes:
-//   const { requireAuth } = require('../middleware/auth');
-//   router.get('/protected', requireAuth, handler);
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { supabaseAdmin } = require('../services/supabase');
+const jwt = require('jsonwebtoken');
 
-/**
- * Express middleware that validates a Supabase JWT Bearer token.
- *
- * Flow:
- *   1. Extract the Bearer token from the Authorization header
- *   2. Call supabaseAdmin.auth.getUser(token) to verify it server-side
- *   3. If valid, attach req.user (Supabase user object) and req.token
- *   4. If invalid or missing, return 401
- *
- * @type {import('express').RequestHandler}
- */
 async function requireAuth(req, res, next) {
   try {
-    // Extract token from "Authorization: Bearer <token>" header
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -33,36 +17,27 @@ async function requireAuth(req, res, next) {
       });
     }
 
-    const token = authHeader.slice(7).trim(); // Remove "Bearer " prefix
+    const token = authHeader.slice(7).trim();
 
     if (!token) {
-      return res.status(401).json({
-        error: 'Unauthorised',
-        message: 'Bearer token is empty',
-      });
+      return res.status(401).json({ error: 'Unauthorised', message: 'Bearer token is empty' });
     }
 
-    // Verify the JWT with Supabase Auth (this validates signature and expiry)
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
 
-    if (error || !data?.user) {
-      return res.status(401).json({
-        error: 'Unauthorised',
-        message: error?.message ?? 'Invalid or expired token',
-      });
-    }
-
-    // Attach the verified user and raw token to the request for downstream use
-    req.user = data.user;   // { id, email, user_metadata, app_metadata, ... }
-    req.token = token;      // Raw JWT for creating user-scoped Supabase clients
+    // Attach minimal user object — all routes use req.user.id to scope queries
+    req.user = { id: payload.sub, email: payload.email, name: payload.name };
 
     return next();
   } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Unauthorised', message: 'Token has expired' });
+    }
+    if (err.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: 'Unauthorised', message: 'Invalid token' });
+    }
     console.error('[requireAuth] Unexpected error:', err.message);
-    return res.status(500).json({
-      error: 'Internal Server Error',
-      message: 'Authentication check failed unexpectedly',
-    });
+    return res.status(500).json({ error: 'Internal Server Error', message: 'Authentication check failed' });
   }
 }
 

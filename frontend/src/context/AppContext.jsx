@@ -1,20 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// AppContext — global state management for AIPM
-// Manages: user, session, workspaces, activeWorkspace, projects,
-//          activeProject, notifications, loading states, real-time subs
+// AppContext — global state management for AIPM (self-hosted, JWT auth)
+// Real-time notifications delivered via SSE (/api/notifications/stream).
 // ═══════════════════════════════════════════════════════════════════════════
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react'
-import { supabase } from '../services/supabase'
 import * as api from '../services/api'
 
-// ─── Context Definition ───────────────────────────────────────────────────────
 const AppContext = createContext(null)
 
-// ─── Provider ────────────────────────────────────────────────────────────────
 export function AppProvider({ children }) {
-  const [user,            setUser]            = useState(null)
-  const [session,         setSession]         = useState(null)
+  const [user,            setUser]            = useState(() => {
+    try { return JSON.parse(localStorage.getItem('aipm_user')) } catch { return null }
+  })
   const [authLoading,     setAuthLoading]     = useState(true)
 
   const [workspaces,      setWorkspaces]      = useState([])
@@ -25,186 +22,125 @@ export function AppProvider({ children }) {
 
   const [notifications,   setNotifications]   = useState([])
 
-  // Ref to store the thread message callback (set by Dashboard when viewing a project)
   const threadMessageCallback = useRef(null)
+  const sseRef                = useRef(null)
 
-  // Real-time subscription refs
-  const notifSubRef  = useRef(null)
-  const threadSubRef = useRef(null)
-
-  // ─── Auth: Check session on mount + listen for changes ─────────────────────
+  // ─── Auth: verify token on mount ────────────────────────────────────────
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session: s } }) => {
-      setSession(s)
-      setUser(s?.user ?? null)
+    const token = localStorage.getItem('aipm_token')
+    if (!token) {
       setAuthLoading(false)
-    })
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
-      setSession(s)
-      setUser(s?.user ?? null)
-      setAuthLoading(false)
-
-      // Clear data on sign-out
-      if (!s) {
-        setWorkspaces([])
-        setProjects([])
-        setNotifications([])
-        setActiveWorkspace(null)
-        setActiveProject(null)
-      }
-    })
-
-    return () => subscription.unsubscribe()
+      return
+    }
+    api.auth.me()
+      .then(u => {
+        setUser(u)
+        localStorage.setItem('aipm_user', JSON.stringify(u))
+      })
+      .catch(() => {
+        // Token invalid — clear storage
+        localStorage.removeItem('aipm_token')
+        localStorage.removeItem('aipm_user')
+        setUser(null)
+      })
+      .finally(() => setAuthLoading(false))
   }, [])
 
-  // ─── Real-time: Notifications table ────────────────────────────────────────
+  // ─── SSE: connect to notification stream when logged in ─────────────────
   useEffect(() => {
     if (!user?.id) {
-      // Cleanup existing subscription
-      if (notifSubRef.current) {
-        supabase.removeChannel(notifSubRef.current)
-        notifSubRef.current = null
-      }
+      if (sseRef.current) { sseRef.current.close(); sseRef.current = null }
       return
     }
 
-    // Subscribe to notifications for this user
-    const channel = supabase
-      .channel(`notifications:${user.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event:  '*',
-          schema: 'public',
-          table:  'notifications',
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          if (payload.eventType === 'INSERT') {
-            setNotifications(prev => [payload.new, ...prev])
-          } else if (payload.eventType === 'UPDATE') {
-            setNotifications(prev =>
-              prev.map(n => n.id === payload.new.id ? payload.new : n)
-            )
-          } else if (payload.eventType === 'DELETE') {
-            setNotifications(prev => prev.filter(n => n.id !== payload.old.id))
-          }
-        }
-      )
-      .subscribe()
+    const token = localStorage.getItem('aipm_token')
+    if (!token) return
 
-    notifSubRef.current = channel
+    const baseURL = import.meta.env.VITE_API_URL || '/api'
+    const es = new EventSource(`${baseURL}/notifications/stream?token=${token}`)
 
-    return () => {
-      supabase.removeChannel(channel)
-      notifSubRef.current = null
+    es.onmessage = (event) => {
+      try {
+        const notif = JSON.parse(event.data)
+        setNotifications(prev => [notif, ...prev])
+      } catch (_) {}
     }
+
+    es.onerror = () => {
+      // EventSource will auto-reconnect; nothing to do
+    }
+
+    sseRef.current = es
+
+    return () => { es.close(); sseRef.current = null }
   }, [user?.id])
 
-  // ─── Real-time: Thread messages ─────────────────────────────────────────────
-  useEffect(() => {
-    if (!activeProject?.id) {
-      if (threadSubRef.current) {
-        supabase.removeChannel(threadSubRef.current)
-        threadSubRef.current = null
-      }
-      return
-    }
+  // ─── Auth helpers ────────────────────────────────────────────────────────
+  const login = useCallback(async ({ email, password }) => {
+    const { token, user: u } = await api.auth.login({ email, password })
+    localStorage.setItem('aipm_token', token)
+    localStorage.setItem('aipm_user', JSON.stringify(u))
+    setUser(u)
+    return u
+  }, [])
 
-    const channel = supabase
-      .channel(`thread:${activeProject.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event:  'INSERT',
-          schema: 'public',
-          table:  'thread_messages',
-          filter: `project_id=eq.${activeProject.id}`,
-        },
-        (payload) => {
-          if (threadMessageCallback.current) {
-            threadMessageCallback.current(payload.new)
-          }
-        }
-      )
-      .subscribe()
+  const register = useCallback(async ({ email, password, name }) => {
+    const { token, user: u } = await api.auth.register({ email, password, name })
+    localStorage.setItem('aipm_token', token)
+    localStorage.setItem('aipm_user', JSON.stringify(u))
+    setUser(u)
+    return u
+  }, [])
 
-    threadSubRef.current = channel
+  const logout = useCallback(() => {
+    localStorage.removeItem('aipm_token')
+    localStorage.removeItem('aipm_user')
+    setUser(null)
+    setWorkspaces([])
+    setProjects([])
+    setNotifications([])
+    setActiveWorkspace(null)
+    setActiveProject(null)
+  }, [])
 
-    return () => {
-      supabase.removeChannel(channel)
-      threadSubRef.current = null
-    }
-  }, [activeProject?.id])
-
-  // ─── Data Fetchers ──────────────────────────────────────────────────────────
+  // ─── Data Fetchers ───────────────────────────────────────────────────────
   const refreshProjects = useCallback(async (workspaceId) => {
     try {
       const data = await api.projects.list(workspaceId)
       setProjects(data)
-    } catch (err) {
-      console.error('[AppContext] refreshProjects error:', err)
-    }
+    } catch (err) { console.error('[AppContext] refreshProjects error:', err) }
   }, [])
 
   const refreshNotifications = useCallback(async () => {
     try {
       const data = await api.notifications.list()
       setNotifications(data)
-    } catch (err) {
-      console.error('[AppContext] refreshNotifications error:', err)
-    }
+    } catch (err) { console.error('[AppContext] refreshNotifications error:', err) }
   }, [])
 
   const refreshWorkspaces = useCallback(async () => {
     try {
       const data = await api.workspaces.list()
       setWorkspaces(data)
-    } catch (err) {
-      console.error('[AppContext] refreshWorkspaces error:', err)
-    }
+    } catch (err) { console.error('[AppContext] refreshWorkspaces error:', err) }
   }, [])
 
-  // ─── Register thread message callback ──────────────────────────────────────
   const setThreadMessageCallback = useCallback((cb) => {
     threadMessageCallback.current = cb
   }, [])
 
-  // ─── Context Value ──────────────────────────────────────────────────────────
   const value = {
-    // Auth
-    user,
-    session,
-    authLoading,
-
-    // Workspaces
-    workspaces,
-    setWorkspaces,
-    activeWorkspace,
-    setActiveWorkspace,
-    refreshWorkspaces,
-
-    // Projects
-    projects,
-    setProjects,
-    activeProject,
-    setActiveProject,
-    refreshProjects,
-
-    // Notifications
-    notifications,
-    setNotifications,
-    refreshNotifications,
-
-    // Real-time thread
+    user, authLoading,
+    login, register, logout,
+    workspaces, setWorkspaces, activeWorkspace, setActiveWorkspace, refreshWorkspaces,
+    projects, setProjects, activeProject, setActiveProject, refreshProjects,
+    notifications, setNotifications, refreshNotifications,
     setThreadMessageCallback,
   }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }
 
-// ─── Hook ─────────────────────────────────────────────────────────────────────
 export function useApp() {
   const ctx = useContext(AppContext)
   if (!ctx) throw new Error('useApp must be used within AppProvider')

@@ -1,367 +1,217 @@
 // ─── Agents Router ────────────────────────────────────────────────────────────
-// Provides full CRUD for AI sub-agents plus a /run endpoint for ad-hoc tasks.
-//
-// POST /api/agents/:id/run flow (general agent run, not task-specific):
-//   1. Load the agent and its project
-//   2. Call runSubAgent() with the provided task description
-//   3. Upload the file output to Supabase Storage
-//   4. Create an output record in the DB
-//   5. Create a thread_message of type 'report'
-//   6. Update agent metrics (tasks_done, cost, tokens_used)
-//   7. Update project totals
-//   8. Create a notification for the user
-//   9. Return the thread message and output
-//
 // Mounted at: /api/agents
+// POST /:id/run — ad-hoc agent execution with local file output.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
+const pool    = require('../db');
 const { requireAuth } = require('../middleware/auth');
-const { getSupabaseForUser, supabaseAdmin } = require('../services/supabase');
 const { runSubAgent } = require('../services/anthropic');
-const { uploadAgentOutput } = require('../services/storageService');
+const redis           = require('../services/redis');
 
 const router = express.Router();
-
-// Apply auth middleware to all routes in this file
 router.use(requireAuth);
 
-// ─── GET /api/agents ──────────────────────────────────────────────────────────
-// List agents for a project.
-// Required query param: ?project_id=<uuid>
-// Returns agents ordered by creation date.
+const UPLOADS_ROOT = process.env.UPLOADS_PATH || '/app/uploads';
+
+// Helper: verify project access
+async function getProjectForUser(projectId, userId) {
+  const { rows } = await pool.query(
+    `SELECT p.* FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+     WHERE p.id = $1 AND w.user_id = $2`,
+    [projectId, userId]
+  );
+  return rows[0] ?? null;
+}
+
+// GET /api/agents?project_id=
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { project_id } = req.query;
+    if (!project_id) return res.status(400).json({ error: 'project_id is required' });
 
-    if (!project_id) {
-      return res.status(400).json({ error: 'project_id query parameter is required' });
-    }
+    const project = await getProjectForUser(project_id, req.user.id);
+    if (!project) return res.status(403).json({ error: 'Access denied' });
 
-    const { data, error } = await supabase
-      .from('agents')
-      .select('*')
-      .eq('project_id', project_id)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-
-    return res.json(data);
+    const { rows } = await pool.query(
+      'SELECT * FROM agents WHERE project_id = $1 ORDER BY created_at DESC',
+      [project_id]
+    );
+    return res.json(rows);
   } catch (err) {
     console.error('[GET /agents]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/agents ─────────────────────────────────────────────────────────
-// Create a new agent within a project.
-// Body: { project_id, name, type, model? }
+// POST /api/agents
 router.post('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { project_id, name, type, model = 'claude-sonnet-4-6' } = req.body;
+    const { project_id, name, emoji, model, status = 'waiting' } = req.body;
+    if (!project_id) return res.status(400).json({ error: 'project_id is required' });
+    if (!name || name.trim() === '') return res.status(400).json({ error: 'Agent name is required' });
 
-    if (!project_id) {
-      return res.status(400).json({ error: 'project_id is required' });
-    }
-    if (!name || typeof name !== 'string' || name.trim() === '') {
-      return res.status(400).json({ error: 'Agent name is required' });
-    }
-    if (!type) {
-      return res.status(400).json({ error: 'Agent type is required' });
-    }
+    const project = await getProjectForUser(project_id, req.user.id);
+    if (!project) return res.status(403).json({ error: 'Access denied' });
 
-    const validTypes = [
-      'Research', 'Code', 'Design', 'Strategy', 'Marketing',
-      'Analysis', 'Writing', 'QA', 'DevOps', 'Security', 'Data', 'Product',
-    ];
-    if (!validTypes.includes(type)) {
-      return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
-    }
-
-    const { data, error } = await supabase
-      .from('agents')
-      .insert({
-        project_id,
-        user_id: req.user.id,
-        name: name.trim(),
-        type,
-        model,
-        status: 'idle',
-        cost: 0,
-        tasks_done: 0,
-        tokens_used: 0,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return res.status(201).json(data);
+    const { rows } = await pool.query(
+      `INSERT INTO agents (project_id, name, emoji, model, status)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [project_id, name.trim(), emoji ?? null, model ?? null, status]
+    );
+    return res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /agents]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ─── PUT /api/agents/:id ──────────────────────────────────────────────────────
-// Update an agent. RLS ensures only the owner can update.
-// Body: any subset of { name, type, model, status }
+// PUT /api/agents/:id
 router.put('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { id } = req.params;
-    const { name, type, model, status } = req.body;
+    const { name, emoji, model, status } = req.body;
 
-    const updates = {};
-    if (name !== undefined) updates.name = name.trim();
-    if (type !== undefined) updates.type = type;
-    if (model !== undefined) updates.model = model;
-    if (status !== undefined) updates.status = status;
+    const sets = [];
+    const vals = [];
+    let   idx  = 1;
 
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No fields provided for update' });
-    }
+    if (name   !== undefined) { sets.push(`name = $${idx++}`);   vals.push(name.trim()); }
+    if (emoji  !== undefined) { sets.push(`emoji = $${idx++}`);  vals.push(emoji); }
+    if (model  !== undefined) { sets.push(`model = $${idx++}`);  vals.push(model); }
+    if (status !== undefined) { sets.push(`status = $${idx++}`); vals.push(status); }
 
-    const { data, error } = await supabase
-      .from('agents')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
+    if (sets.length === 0) return res.status(400).json({ error: 'No fields provided for update' });
 
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Agent not found or access denied' });
-
-    return res.json(data);
+    vals.push(id, req.user.id);
+    const { rows } = await pool.query(
+      `UPDATE agents a SET ${sets.join(', ')}
+       FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+       WHERE a.id = $${idx++} AND a.project_id = p.id AND w.user_id = $${idx}
+       RETURNING a.*`,
+      vals
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Agent not found or access denied' });
+    return res.json(rows[0]);
   } catch (err) {
     console.error('[PUT /agents/:id]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ─── DELETE /api/agents/:id ───────────────────────────────────────────────────
-// Delete an agent. Associated outputs/messages will have agent_id set to NULL.
+// DELETE /api/agents/:id
 router.delete('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
-
-    const { error } = await supabase
-      .from('agents')
-      .delete()
-      .eq('id', id);
-
-    if (error) throw error;
-
-    return res.json({ success: true, message: 'Agent deleted' });
+    await pool.query(
+      `DELETE FROM agents a
+       USING projects p JOIN workspaces w ON w.id = p.workspace_id
+       WHERE a.id = $1 AND a.project_id = p.id AND w.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    return res.json({ success: true });
   } catch (err) {
     console.error('[DELETE /agents/:id]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/agents/:id/run ─────────────────────────────────────────────────
-// Run a general (non-task-specific) agent task.
-// Body: { task_description, output_filename? }
+// POST /api/agents/:id/run
 router.post('/:id/run', async (req, res) => {
-  const supabase = getSupabaseForUser(req.token);
   const userId = req.user.id;
   const { id: agentId } = req.params;
 
   try {
     const { task_description, output_filename } = req.body;
-
-    if (!task_description || typeof task_description !== 'string' || task_description.trim() === '') {
+    if (!task_description || task_description.trim() === '') {
       return res.status(400).json({ error: 'task_description is required' });
     }
 
-    // Step 1: Load the agent
-    const { data: agent, error: agentError } = await supabase
-      .from('agents')
-      .select('*')
-      .eq('id', agentId)
-      .single();
+    // Load agent + project
+    const { rows: agentRows } = await pool.query(
+      `SELECT a.*, p.name AS project_name, p.goal AS project_goal, p.id AS project_id
+       FROM agents a
+       JOIN projects p ON p.id = a.project_id
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE a.id = $1 AND w.user_id = $2`,
+      [agentId, userId]
+    );
+    if (!agentRows[0]) return res.status(404).json({ error: 'Agent not found' });
+    const agent = agentRows[0];
 
-    if (agentError || !agent) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    // Update status to active
+    await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['active', agentId]);
 
-    // Load the project for context
-    const { data: project, error: projectError } = await supabase
-      .from('projects')
-      .select('*')
-      .eq('id', agent.project_id)
-      .single();
+    const { rows: milestones } = await pool.query(
+      'SELECT name, status FROM milestones WHERE project_id = $1 ORDER BY position ASC',
+      [agent.project_id]
+    );
 
-    if (projectError || !project) {
-      throw new Error('Project not found for this agent');
-    }
-
-    // Load milestones for context
-    const { data: milestones } = await supabase
-      .from('milestones')
-      .select('name, status, due_date')
-      .eq('project_id', agent.project_id)
-      .order('order_idx', { ascending: true });
-
-    // Step 2: Mark agent as active
-    await supabase
-      .from('agents')
-      .update({ status: 'active', last_active: new Date().toISOString() })
-      .eq('id', agentId);
-
-    // Step 3: Build project context and run the agent
     const projectContext = {
-      projectName: project.name,
-      projectGoal: project.goal,
-      projectStatus: project.status,
-      milestones: milestones ?? [],
+      projectName: agent.project_name,
+      projectGoal: agent.project_goal,
+      milestones,
       agentName: agent.name,
-      agentType: agent.type,
     };
 
-    const filename = output_filename
-      || `${agent.type.toLowerCase()}-${Date.now()}.md`;
+    const filename = output_filename || `${(agent.name || 'agent').toLowerCase().replace(/\s+/g,'-')}-${Date.now()}.md`;
 
-    const agentResult = await runSubAgent(
-      agent.type,
-      task_description.trim(),
-      projectContext,
-      filename
+    const agentResult = await runSubAgent(agent.name, task_description.trim(), projectContext, filename);
+
+    // Save to disk
+    const outputDir = path.join(UPLOADS_ROOT, userId, agent.project_id);
+    fs.mkdirSync(outputDir, { recursive: true });
+    const filepath = path.join(outputDir, filename);
+    fs.writeFileSync(filepath, agentResult.fileContent, 'utf8');
+    const sizeKb = Math.ceil(Buffer.byteLength(agentResult.fileContent, 'utf8') / 1024);
+
+    // Output record (no task_id for ad-hoc agent runs)
+    const { rows: outRows } = await pool.query(
+      `INSERT INTO outputs (agent, filename, filepath, size_kb)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [agent.name, filename, filepath, sizeKb]
     );
+    const outputRecord = outRows[0];
 
-    // Step 4: Upload file to Supabase Storage
-    const { path: storagePath, size: fileSize } = await uploadAgentOutput(
-      userId,
-      agent.project_id,
-      filename,
-      agentResult.fileContent
-    );
-
-    // Step 5: Create output record
-    const { data: outputRecord, error: outputError } = await supabaseAdmin
-      .from('outputs')
-      .insert({
-        project_id: agent.project_id,
-        task_id: null,
-        agent_id: agentId,
-        user_id: userId,
-        filename,
-        file_type: 'md',
-        file_size: fileSize,
-        storage_path: storagePath,
-        description: `${agent.type} Agent output: ${task_description.trim().slice(0, 100)}`,
-        is_public: false,
-      })
-      .select()
-      .single();
-
-    if (outputError) throw outputError;
-
-    // Step 6: Create a thread message
-    const fieldLines = agentResult.fields
-      .map(([k, v]) => `- **${k}**: ${v}`)
-      .join('\n');
-
-    const messageContent = `## ${agentResult.label}
-
-**Agent**: ${agent.name} (${agent.type})
-**Task**: ${task_description.trim().slice(0, 200)}
-
-${fieldLines ? `### Summary\n${fieldLines}\n` : ''}
-### Output Preview
-${agentResult.content.slice(0, 1000)}${agentResult.content.length > 1000 ? '\n\n_[Full output available for download]_' : ''}`;
-
-    const { data: threadMessage, error: msgError } = await supabaseAdmin
-      .from('thread_messages')
-      .insert({
-        project_id: agent.project_id,
-        user_id: userId,
-        from_name: agent.name,
-        from_type: 'agent',
-        agent_id: agentId,
-        type: 'report',
-        content: messageContent,
-        deliverables: [
-          { label: filename, status: 'completed', output_id: outputRecord.id },
-        ],
-        metadata: {
-          label: agentResult.label,
-          fields: agentResult.fields,
-          agentType: agent.type,
-        },
-        tokens_used: agentResult.inputTokens + agentResult.outputTokens,
-        cost: agentResult.cost,
-      })
-      .select()
-      .single();
-
-    if (msgError) throw msgError;
-
-    // Step 7: Update agent metrics
+    // Thread message
     const totalTokens = agentResult.inputTokens + agentResult.outputTokens;
-    await supabaseAdmin
-      .from('agents')
-      .update({
-        status: 'idle',
-        tasks_done: (agent.tasks_done ?? 0) + 1,
-        tokens_used: (agent.tokens_used ?? 0) + totalTokens,
-        cost: Number(agent.cost ?? 0) + agentResult.cost,
-        last_active: new Date().toISOString(),
-      })
-      .eq('id', agentId);
+    const { rows: msgRows } = await pool.query(
+      `INSERT INTO thread_messages (project_id, from_type, name, type, label, text, deliverables)
+       VALUES ($1, 'agent', $2, 'report', $3, $4, $5) RETURNING *`,
+      [
+        agent.project_id,
+        agent.name,
+        agentResult.label,
+        agentResult.content.slice(0, 1000),
+        JSON.stringify([{ label: filename, status: 'completed', output_id: outputRecord.id }]),
+      ]
+    );
 
-    // Step 8: Update project totals
-    await supabaseAdmin
-      .from('projects')
-      .update({
-        tokens_used: (project.tokens_used ?? 0) + totalTokens,
-        total_cost: Number(project.total_cost ?? 0) + agentResult.cost,
-      })
-      .eq('id', agent.project_id);
+    // Update agent metrics
+    await pool.query(
+      `UPDATE agents SET status = 'idle', tasks_done = tasks_done + 1, cost = cost + $1 WHERE id = $2`,
+      [agentResult.cost, agentId]
+    );
 
-    // Step 9: Create notification
-    await supabaseAdmin
-      .from('notifications')
-      .insert({
-        user_id: userId,
-        project_id: agent.project_id,
-        category: 'agent',
-        level: 'success',
-        title: `${agent.name} Completed Task`,
-        message: `${agent.type} Agent finished the task and generated ${filename}.`,
-        is_read: false,
-        actions: [
-          { label: 'View Project', href: `/projects/${agent.project_id}`, style: 'primary' },
-        ],
-        metadata: {
-          agentId,
-          agentType: agent.type,
-          outputId: outputRecord.id,
-          tokensUsed: totalTokens,
-          cost: agentResult.cost,
-        },
-      });
+    // Update project totals
+    await pool.query(
+      `UPDATE projects SET token_used = token_used + $1, cost = cost + $2 WHERE id = $3`,
+      [totalTokens, agentResult.cost, agent.project_id]
+    );
 
-    // Step 10: Return results
-    return res.json({
-      threadMessage,
-      output: outputRecord,
-      tokensUsed: totalTokens,
-      cost: agentResult.cost,
-    });
+    // Notification + Redis publish
+    const { rows: notifRows } = await pool.query(
+      `INSERT INTO notifications (user_id, type, level, title, summary, project, agent, token_used)
+       VALUES ($1, 'agent', 'success', $2, $3, $4, $5, $6) RETURNING *`,
+      [userId, `${agent.name} Completed Task`, `Agent finished and generated ${filename}.`, agent.project_id, agent.name, totalTokens]
+    );
+    try { await redis.publish(`notifications:${userId}`, JSON.stringify(notifRows[0])); } catch (_) {}
+
+    return res.json({ threadMessage: msgRows[0], output: outputRecord, tokensUsed: totalTokens, cost: agentResult.cost });
   } catch (err) {
     console.error('[POST /agents/:id/run]', err.message);
-
-    // Reset agent status to idle on error
-    await supabaseAdmin
-      .from('agents')
-      .update({ status: 'error' })
-      .eq('id', agentId)
-      .catch(() => {});
-
+    await pool.query('UPDATE agents SET status = $1 WHERE id = $2', ['error', agentId]).catch(() => {});
     return res.status(500).json({ error: err.message });
   }
 });

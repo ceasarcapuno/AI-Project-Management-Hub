@@ -1,43 +1,76 @@
 // ─── Notifications Router ─────────────────────────────────────────────────────
-// Provides CRUD operations for user notifications.
-// Supabase Realtime is enabled on the notifications table (see schema.sql),
-// so the frontend can subscribe directly for live updates.
-//
 // Mounted at: /api/notifications
+// GET /stream — SSE endpoint (token via ?token= query param for EventSource compat)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
+const jwt     = require('jsonwebtoken');
+const pool    = require('../db');
+const Redis   = require('ioredis');
 const { requireAuth } = require('../middleware/auth');
-const { getSupabaseForUser } = require('../services/supabase');
 
 const router = express.Router();
 
-// Apply auth middleware to all routes in this file
+// ─── GET /api/notifications/stream (SSE — NO requireAuth middleware) ──────────
+// EventSource cannot set headers, so the JWT is passed as ?token=<jwt>
+router.get('/stream', (req, res) => {
+  const token = req.query.token;
+  if (!token) {
+    res.status(401).end();
+    return;
+  }
+
+  let userId;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    userId = payload.sub;
+  } catch (_) {
+    res.status(401).end();
+    return;
+  }
+
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  const sub     = new Redis(process.env.REDIS_URL);
+  const channel = `notifications:${userId}`;
+
+  sub.subscribe(channel, (err) => {
+    if (err) {
+      console.error('[SSE] Redis subscribe error:', err.message);
+      res.end();
+    }
+  });
+
+  sub.on('message', (_ch, message) => {
+    res.write(`data: ${message}\n\n`);
+  });
+
+  // Heartbeat every 25 s
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sub.unsubscribe(channel);
+    sub.quit();
+  });
+});
+
+// Apply auth middleware to all remaining routes
 router.use(requireAuth);
 
 // ─── GET /api/notifications ───────────────────────────────────────────────────
-// List all notifications for the authenticated user.
-// Returns most recent first (descending created_at).
-// Optional query: ?unread_only=true to filter to unread notifications only.
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { unread_only } = req.query;
+    let sql = 'SELECT * FROM notifications WHERE user_id = $1';
+    if (unread_only === 'true') sql += ' AND read = FALSE';
+    sql += ' ORDER BY created_at DESC LIMIT 100';
 
-    let query = supabase
-      .from('notifications')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(100); // Reasonable page size
-
-    if (unread_only === 'true') {
-      query = query.eq('is_read', false);
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    return res.json(data);
+    const { rows } = await pool.query(sql, [req.user.id]);
+    return res.json(rows);
   } catch (err) {
     console.error('[GET /notifications]', err.message);
     return res.status(500).json({ error: err.message });
@@ -45,57 +78,20 @@ router.get('/', async (req, res) => {
 });
 
 // ─── POST /api/notifications ──────────────────────────────────────────────────
-// Create a new notification for the authenticated user.
-// Body: { project_id?, category, level, title, message, actions?, metadata? }
 router.post('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const {
-      project_id,
-      category = 'system',
-      level = 'info',
-      title,
-      message,
-      actions = [],
-      metadata = {},
-    } = req.body;
+    const { type = 'system', level = 'info', title, summary, detail, project, agent, actions, token_used, token_limit } = req.body;
+    if (!title || title.trim() === '') return res.status(400).json({ error: 'title is required' });
 
-    if (!title || typeof title !== 'string' || title.trim() === '') {
-      return res.status(400).json({ error: 'Notification title is required' });
-    }
-    if (!message || typeof message !== 'string' || message.trim() === '') {
-      return res.status(400).json({ error: 'Notification message is required' });
-    }
-
-    const validCategories = ['milestone', 'agent', 'task', 'output', 'cost', 'deadline', 'system', 'collaboration'];
-    const validLevels = ['info', 'warning', 'error', 'success'];
-
-    if (!validCategories.includes(category)) {
-      return res.status(400).json({ error: `category must be one of: ${validCategories.join(', ')}` });
-    }
-    if (!validLevels.includes(level)) {
-      return res.status(400).json({ error: `level must be one of: ${validLevels.join(', ')}` });
-    }
-
-    const { data, error } = await supabase
-      .from('notifications')
-      .insert({
-        user_id: req.user.id,
-        project_id: project_id ?? null,
-        category,
-        level,
-        title: title.trim(),
-        message: message.trim(),
-        is_read: false,
-        actions: Array.isArray(actions) ? actions : [],
-        metadata: typeof metadata === 'object' ? metadata : {},
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return res.status(201).json(data);
+    const { rows } = await pool.query(
+      `INSERT INTO notifications (user_id, type, level, title, summary, detail, project, agent, actions, token_used, token_limit)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [req.user.id, type, level, title.trim(), summary ?? null, detail ?? null,
+       project ?? null, agent ?? null,
+       actions ? JSON.stringify(actions) : null,
+       token_used ?? null, token_limit ?? null]
+    );
+    return res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /notifications]', err.message);
     return res.status(500).json({ error: err.message });
@@ -103,21 +99,13 @@ router.post('/', async (req, res) => {
 });
 
 // ─── PATCH /api/notifications/mark-all-read ───────────────────────────────────
-// Mark ALL unread notifications for the user as read.
-// This route must be defined BEFORE /:id to avoid "mark-all-read" being
-// interpreted as an ID parameter.
 router.patch('/mark-all-read', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-
-    const { error } = await supabase
-      .from('notifications')
-      .update({ is_read: true })
-      .eq('is_read', false); // RLS ensures this only affects the user's own rows
-
-    if (error) throw error;
-
-    return res.json({ success: true, message: 'All notifications marked as read' });
+    await pool.query(
+      'UPDATE notifications SET read = TRUE WHERE user_id = $1 AND read = FALSE',
+      [req.user.id]
+    );
+    return res.json({ success: true });
   } catch (err) {
     console.error('[PATCH /notifications/mark-all-read]', err.message);
     return res.status(500).json({ error: err.message });
@@ -125,34 +113,14 @@ router.patch('/mark-all-read', async (req, res) => {
 });
 
 // ─── PATCH /api/notifications/:id ────────────────────────────────────────────
-// Update a single notification (typically to mark as read).
-// Body: { is_read?: boolean, title?: string, message?: string }
 router.patch('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
-    const { is_read, title, message } = req.body;
-
-    const updates = {};
-    if (is_read !== undefined) updates.is_read = Boolean(is_read);
-    if (title !== undefined) updates.title = title.trim();
-    if (message !== undefined) updates.message = message.trim();
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No fields provided for update' });
-    }
-
-    const { data, error } = await supabase
-      .from('notifications')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Notification not found or access denied' });
-
-    return res.json(data);
+    const { rows } = await pool.query(
+      `UPDATE notifications SET read = $1 WHERE id = $2 AND user_id = $3 RETURNING *`,
+      [Boolean(req.body.read), req.params.id, req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Notification not found' });
+    return res.json(rows[0]);
   } catch (err) {
     console.error('[PATCH /notifications/:id]', err.message);
     return res.status(500).json({ error: err.message });
@@ -160,20 +128,13 @@ router.patch('/:id', async (req, res) => {
 });
 
 // ─── DELETE /api/notifications/:id ───────────────────────────────────────────
-// Delete a single notification.
 router.delete('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
-
-    const { error } = await supabase
-      .from('notifications')
-      .delete()
-      .eq('id', id);
-
-    if (error) throw error;
-
-    return res.json({ success: true, message: 'Notification deleted' });
+    await pool.query(
+      'DELETE FROM notifications WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    return res.json({ success: true });
   } catch (err) {
     console.error('[DELETE /notifications/:id]', err.message);
     return res.status(500).json({ error: err.message });

@@ -1,58 +1,42 @@
 // ─── Tasks Router ─────────────────────────────────────────────────────────────
-// Provides full CRUD for tasks plus a /run endpoint that triggers an AI agent.
-//
-// POST /api/tasks/:id/run flow:
-//   1. Load task + agent + project data
-//   2. Call runSubAgent() with the task description
-//   3. Upload the file output to Supabase Storage
-//   4. Create an output record in the DB
-//   5. Create a thread_message of type 'report'
-//   6. Update task status and token/cost metrics
-//   7. Update agent metrics
-//   8. Create a notification for the user
-//   9. Return the thread message
-//
 // Mounted at: /api/tasks
+// POST /:id/run triggers AI agent execution and saves output to local filesystem.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
-const { requireAuth } = require('../middleware/auth');
-const { getSupabaseForUser, supabaseAdmin } = require('../services/supabase');
-const { runSubAgent } = require('../services/anthropic');
-const { uploadAgentOutput } = require('../services/storageService');
+const fs      = require('fs');
+const path    = require('path');
+const pool    = require('../db');
+const { requireAuth }  = require('../middleware/auth');
+const { runSubAgent }  = require('../services/anthropic');
+const redis            = require('../services/redis');
 
 const router = express.Router();
-
-// Apply auth middleware to all routes in this file
 router.use(requireAuth);
 
+const UPLOADS_ROOT = process.env.UPLOADS_PATH || '/app/uploads';
+
 // ─── GET /api/tasks ───────────────────────────────────────────────────────────
-// List tasks with optional filtering.
-// Query params: ?project_id=<uuid>&milestone_id=<uuid>
-// Returns tasks ordered by order_idx ascending.
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { project_id, milestone_id } = req.query;
+    if (!project_id) return res.status(400).json({ error: 'project_id is required' });
 
-    if (!project_id) {
-      return res.status(400).json({ error: 'project_id query parameter is required' });
-    }
-
-    let query = supabase
-      .from('tasks')
-      .select('*')
-      .eq('project_id', project_id)
-      .order('order_idx', { ascending: true });
+    let sql  = `SELECT t.* FROM tasks t
+                JOIN milestones m ON m.id = t.milestone_id
+                JOIN projects p ON p.id = m.project_id
+                JOIN workspaces w ON w.id = p.workspace_id
+                WHERE p.id = $1 AND w.user_id = $2`;
+    const vals = [project_id, req.user.id];
 
     if (milestone_id) {
-      query = query.eq('milestone_id', milestone_id);
+      sql += ` AND t.milestone_id = $3`;
+      vals.push(milestone_id);
     }
+    sql += ' ORDER BY t.position ASC';
 
-    const { data, error } = await query;
-    if (error) throw error;
-
-    return res.json(data);
+    const { rows } = await pool.query(sql, vals);
+    return res.json(rows);
   } catch (err) {
     console.error('[GET /tasks]', err.message);
     return res.status(500).json({ error: err.message });
@@ -60,57 +44,18 @@ router.get('/', async (req, res) => {
 });
 
 // ─── POST /api/tasks ──────────────────────────────────────────────────────────
-// Create a new task.
-// Body: { project_id, milestone_id?, name, description?, assigned_agent_type?, model?, priority?, order_idx? }
 router.post('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const {
-      project_id,
-      milestone_id,
-      name,
-      description,
-      assigned_agent_type,
-      model = 'claude-sonnet-4-6',
-      priority = 'medium',
-      order_idx = 0,
-    } = req.body;
+    const { milestone_id, name, status = 'todo', agent, model, position = 0 } = req.body;
+    if (!milestone_id) return res.status(400).json({ error: 'milestone_id is required' });
+    if (!name || name.trim() === '') return res.status(400).json({ error: 'Task name is required' });
 
-    if (!project_id) {
-      return res.status(400).json({ error: 'project_id is required' });
-    }
-    if (!name || typeof name !== 'string' || name.trim() === '') {
-      return res.status(400).json({ error: 'Task name is required' });
-    }
-
-    const validPriorities = ['low', 'medium', 'high', 'critical'];
-    if (!validPriorities.includes(priority)) {
-      return res.status(400).json({ error: `priority must be one of: ${validPriorities.join(', ')}` });
-    }
-
-    const { data, error } = await supabase
-      .from('tasks')
-      .insert({
-        project_id,
-        milestone_id: milestone_id ?? null,
-        user_id: req.user.id,
-        name: name.trim(),
-        description: description ?? null,
-        status: 'pending',
-        assigned_agent_type: assigned_agent_type ?? null,
-        model,
-        priority,
-        order_idx: Number(order_idx),
-        estimated_tokens: 0,
-        actual_tokens: 0,
-        cost: 0,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return res.status(201).json(data);
+    const { rows } = await pool.query(
+      `INSERT INTO tasks (milestone_id, name, status, agent, model, position)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [milestone_id, name.trim(), status, agent ?? null, model ?? null, Number(position)]
+    );
+    return res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /tasks]', err.message);
     return res.status(500).json({ error: err.message });
@@ -118,50 +63,35 @@ router.post('/', async (req, res) => {
 });
 
 // ─── PUT /api/tasks/:id ───────────────────────────────────────────────────────
-// Update a task. RLS ensures only the owner can update.
 router.put('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
     const { id } = req.params;
-    const {
-      name, description, status, assigned_agent_type,
-      model, priority, order_idx, milestone_id,
-      estimated_tokens, actual_tokens, cost,
-    } = req.body;
+    const { name, status, agent, model, position } = req.body;
 
-    const updates = {};
-    if (name !== undefined) updates.name = name.trim();
-    if (description !== undefined) updates.description = description;
-    if (status !== undefined) updates.status = status;
-    if (assigned_agent_type !== undefined) updates.assigned_agent_type = assigned_agent_type;
-    if (model !== undefined) updates.model = model;
-    if (priority !== undefined) updates.priority = priority;
-    if (order_idx !== undefined) updates.order_idx = Number(order_idx);
-    if (milestone_id !== undefined) updates.milestone_id = milestone_id;
-    if (estimated_tokens !== undefined) updates.estimated_tokens = Number(estimated_tokens);
-    if (actual_tokens !== undefined) updates.actual_tokens = Number(actual_tokens);
-    if (cost !== undefined) updates.cost = Number(cost);
+    const sets = [];
+    const vals = [];
+    let   idx  = 1;
 
-    // Auto-set completed_at when status changes to completed
-    if (status === 'completed') {
-      updates.completed_at = new Date().toISOString();
-    }
+    if (name     !== undefined) { sets.push(`name = $${idx++}`);     vals.push(name.trim()); }
+    if (status   !== undefined) { sets.push(`status = $${idx++}`);   vals.push(status); }
+    if (agent    !== undefined) { sets.push(`agent = $${idx++}`);    vals.push(agent); }
+    if (model    !== undefined) { sets.push(`model = $${idx++}`);    vals.push(model); }
+    if (position !== undefined) { sets.push(`position = $${idx++}`); vals.push(Number(position)); }
 
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No fields provided for update' });
-    }
+    if (sets.length === 0) return res.status(400).json({ error: 'No fields provided for update' });
 
-    const { data, error } = await supabase
-      .from('tasks')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Task not found or access denied' });
-
-    return res.json(data);
+    vals.push(id, req.user.id);
+    const { rows } = await pool.query(
+      `UPDATE tasks t SET ${sets.join(', ')}
+       FROM milestones m
+       JOIN projects p  ON p.id = m.project_id
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE t.id = $${idx++} AND t.milestone_id = m.id AND w.user_id = $${idx}
+       RETURNING t.*`,
+      vals
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Task not found or access denied' });
+    return res.json(rows[0]);
   } catch (err) {
     console.error('[PUT /tasks/:id]', err.message);
     return res.status(500).json({ error: err.message });
@@ -169,20 +99,17 @@ router.put('/:id', async (req, res) => {
 });
 
 // ─── DELETE /api/tasks/:id ────────────────────────────────────────────────────
-// Delete a task. Associated outputs will have task_id set to NULL.
 router.delete('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
-
-    const { error } = await supabase
-      .from('tasks')
-      .delete()
-      .eq('id', id);
-
-    if (error) throw error;
-
-    return res.json({ success: true, message: 'Task deleted' });
+    await pool.query(
+      `DELETE FROM tasks t
+       USING milestones m
+       JOIN projects p   ON p.id = m.project_id
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE t.id = $1 AND t.milestone_id = m.id AND w.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    return res.json({ success: true });
   } catch (err) {
     console.error('[DELETE /tasks/:id]', err.message);
     return res.status(500).json({ error: err.message });
@@ -190,270 +117,121 @@ router.delete('/:id', async (req, res) => {
 });
 
 // ─── POST /api/tasks/:id/run ──────────────────────────────────────────────────
-// Trigger an AI agent to execute this task.
-// This is the core AI execution endpoint for task-level agent runs.
 router.post('/:id/run', async (req, res) => {
-  const supabase = getSupabaseForUser(req.token);
   const userId = req.user.id;
   const { id: taskId } = req.params;
 
   try {
-    // Step 1: Load the task and its project
-    const { data: task, error: taskError } = await supabase
-      .from('tasks')
-      .select('*')
-      .eq('id', taskId)
-      .single();
+    // Load task with project context
+    const { rows: taskRows } = await pool.query(
+      `SELECT t.*, m.project_id, p.name AS project_name, p.goal AS project_goal
+       FROM tasks t
+       JOIN milestones m  ON m.id = t.milestone_id
+       JOIN projects p    ON p.id = m.project_id
+       JOIN workspaces w  ON w.id = p.workspace_id
+       WHERE t.id = $1 AND w.user_id = $2`,
+      [taskId, userId]
+    );
 
-    if (taskError || !task) {
-      return res.status(404).json({ error: 'Task not found' });
+    if (!taskRows[0]) return res.status(404).json({ error: 'Task not found' });
+    const task = taskRows[0];
+
+    if (!task.agent) {
+      return res.status(400).json({ error: 'Task has no assigned agent. Set an agent before running.' });
     }
 
-    if (!task.assigned_agent_type) {
-      return res.status(400).json({ error: 'Task has no assigned agent type. Please assign an agent before running.' });
-    }
+    // Mark in-progress
+    await pool.query('UPDATE tasks SET status = $1 WHERE id = $2', ['in_progress', taskId]);
 
-    // Mark task as in-progress immediately
-    await supabase
-      .from('tasks')
-      .update({ status: 'in_progress' })
-      .eq('id', taskId);
+    // Load milestones for project context
+    const { rows: milestones } = await pool.query(
+      'SELECT name, status FROM milestones WHERE project_id = $1 ORDER BY position ASC',
+      [task.project_id]
+    );
 
-    // Load the project for context
-    const { data: project, error: projectError } = await supabase
-      .from('projects')
-      .select('*')
-      .eq('id', task.project_id)
-      .single();
-
-    if (projectError || !project) {
-      throw new Error('Project not found for this task');
-    }
-
-    // Load milestones summary for project context
-    const { data: milestones } = await supabase
-      .from('milestones')
-      .select('name, status, due_date')
-      .eq('project_id', task.project_id)
-      .order('order_idx', { ascending: true });
-
-    // Find the agent assigned to this task type in the project (if one exists)
-    const { data: agents } = await supabase
-      .from('agents')
-      .select('*')
-      .eq('project_id', task.project_id)
-      .eq('type', task.assigned_agent_type)
-      .limit(1);
-
-    const assignedAgent = agents?.[0] ?? null;
-
-    // Step 2: Build project context and run the agent
     const projectContext = {
-      projectName: project.name,
-      projectGoal: project.goal,
-      projectStatus: project.status,
-      milestones: milestones ?? [],
-      activeAgents: agents?.map((a) => ({ name: a.name, type: a.type, status: a.status })) ?? [],
+      projectName: task.project_name,
+      projectGoal: task.project_goal,
+      milestones,
       taskName: task.name,
-      taskPriority: task.priority,
     };
 
-    const outputFilename = `${task.assigned_agent_type.toLowerCase()}-${task.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')}-${Date.now()}.md`;
-    const taskDescription = task.description || task.name;
+    const outputFilename = `${task.agent.toLowerCase()}-${task.name.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'')}-${Date.now()}.md`;
 
-    // Mark the agent as active if found
-    if (assignedAgent) {
-      await supabase
-        .from('agents')
-        .update({ status: 'active', last_active: new Date().toISOString() })
-        .eq('id', assignedAgent.id);
-    }
+    // Run the AI agent
+    const agentResult = await runSubAgent(task.agent, task.name, projectContext, outputFilename);
 
-    const agentResult = await runSubAgent(
-      task.assigned_agent_type,
-      taskDescription,
-      projectContext,
-      outputFilename
+    // Save file to local filesystem
+    const outputDir  = path.join(UPLOADS_ROOT, userId, task.project_id);
+    fs.mkdirSync(outputDir, { recursive: true });
+    const filepath = path.join(outputDir, outputFilename);
+    fs.writeFileSync(filepath, agentResult.fileContent, 'utf8');
+    const sizeKb = Math.ceil(Buffer.byteLength(agentResult.fileContent, 'utf8') / 1024);
+
+    // Insert output record
+    const { rows: outRows } = await pool.query(
+      `INSERT INTO outputs (task_id, agent, filename, filepath, size_kb)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [taskId, task.agent, outputFilename, filepath, sizeKb]
     );
+    const outputRecord = outRows[0];
 
-    // Step 3: Upload file to Supabase Storage
-    const { path: storagePath, size: fileSize } = await uploadAgentOutput(
-      userId,
-      task.project_id,
-      outputFilename,
-      agentResult.fileContent
-    );
-
-    // Step 4: Create output record in DB using admin client for reliability
-    const { data: outputRecord, error: outputError } = await supabaseAdmin
-      .from('outputs')
-      .insert({
-        project_id: task.project_id,
-        task_id: taskId,
-        agent_id: assignedAgent?.id ?? null,
-        user_id: userId,
-        filename: outputFilename,
-        file_type: 'md',
-        file_size: fileSize,
-        storage_path: storagePath,
-        description: `${task.assigned_agent_type} agent output for task: ${task.name}`,
-        is_public: false,
-      })
-      .select()
-      .single();
-
-    if (outputError) throw outputError;
-
-    // Step 5: Create a thread message with the agent's structured report
-    const messageContent = buildReportContent(task, agentResult);
-    const messageType = determineMessageType(agentResult.label);
-
-    const { data: threadMessage, error: msgError } = await supabaseAdmin
-      .from('thread_messages')
-      .insert({
-        project_id: task.project_id,
-        user_id: userId,
-        from_name: assignedAgent?.name ?? `${task.assigned_agent_type} Agent`,
-        from_type: 'agent',
-        agent_id: assignedAgent?.id ?? null,
-        type: messageType,
-        content: messageContent,
-        deliverables: [
-          {
-            label: outputFilename,
-            status: 'completed',
-            output_id: outputRecord.id,
-          },
-        ],
-        metadata: {
-          label: agentResult.label,
-          fields: agentResult.fields,
-          agentType: task.assigned_agent_type,
-          taskId,
-        },
-        tokens_used: agentResult.inputTokens + agentResult.outputTokens,
-        cost: agentResult.cost,
-      })
-      .select()
-      .single();
-
-    if (msgError) throw msgError;
-
-    // Step 6: Update task to completed with token/cost metrics
+    // Insert thread message
     const totalTokens = agentResult.inputTokens + agentResult.outputTokens;
-    await supabaseAdmin
-      .from('tasks')
-      .update({
-        status: 'completed',
-        actual_tokens: totalTokens,
-        cost: agentResult.cost,
-        completed_at: new Date().toISOString(),
-      })
-      .eq('id', taskId);
+    const preview     = agentResult.content.slice(0, 1000);
+    const { rows: msgRows } = await pool.query(
+      `INSERT INTO thread_messages (project_id, from_type, name, type, label, text, deliverables)
+       VALUES ($1, 'agent', $2, 'report', $3, $4, $5) RETURNING *`,
+      [
+        task.project_id,
+        `${task.agent} Agent`,
+        agentResult.label,
+        preview,
+        JSON.stringify([{ label: outputFilename, status: 'completed', output_id: outputRecord.id }]),
+      ]
+    );
+    const threadMessage = msgRows[0];
 
-    // Step 7: Update agent metrics
-    if (assignedAgent) {
-      await supabaseAdmin
-        .from('agents')
-        .update({
-          status: 'idle',
-          tasks_done: (assignedAgent.tasks_done ?? 0) + 1,
-          tokens_used: (assignedAgent.tokens_used ?? 0) + totalTokens,
-          cost: Number(assignedAgent.cost ?? 0) + agentResult.cost,
-          last_active: new Date().toISOString(),
-        })
-        .eq('id', assignedAgent.id);
+    // Mark task completed, update token/cost
+    await pool.query(
+      `UPDATE tasks SET status = 'completed' WHERE id = $1`,
+      [taskId]
+    );
+
+    // Update project token_used and cost
+    await pool.query(
+      `UPDATE projects SET token_used = token_used + $1, cost = cost + $2
+       WHERE id = $3`,
+      [totalTokens, agentResult.cost, task.project_id]
+    );
+
+    // Create notification and publish to Redis
+    const { rows: notifRows } = await pool.query(
+      `INSERT INTO notifications (user_id, type, level, title, summary, project, agent, token_used)
+       VALUES ($1, 'task', 'success', $2, $3, $4, $5, $6) RETURNING *`,
+      [
+        userId,
+        `Task Completed: ${task.name}`,
+        `${task.agent} Agent completed "${task.name}" and generated ${outputFilename}.`,
+        task.project_id,
+        task.agent,
+        totalTokens,
+      ]
+    );
+
+    // Publish to Redis SSE channel
+    try {
+      await redis.publish(`notifications:${userId}`, JSON.stringify(notifRows[0]));
+    } catch (redisErr) {
+      console.warn('[tasks/run] Redis publish failed (non-fatal):', redisErr.message);
     }
 
-    // Step 8: Update project totals
-    await supabaseAdmin
-      .from('projects')
-      .update({
-        tokens_used: (project.tokens_used ?? 0) + totalTokens,
-        total_cost: Number(project.total_cost ?? 0) + agentResult.cost,
-      })
-      .eq('id', task.project_id);
-
-    // Step 9: Create a notification for the user
-    await supabaseAdmin
-      .from('notifications')
-      .insert({
-        user_id: userId,
-        project_id: task.project_id,
-        category: 'task',
-        level: 'success',
-        title: `Task Completed: ${task.name}`,
-        message: `${task.assigned_agent_type} Agent completed "${task.name}" and generated ${outputFilename}.`,
-        is_read: false,
-        actions: [
-          { label: 'View Output', href: `/projects/${task.project_id}`, style: 'primary' },
-        ],
-        metadata: {
-          taskId,
-          agentType: task.assigned_agent_type,
-          outputId: outputRecord.id,
-          tokensUsed: totalTokens,
-          cost: agentResult.cost,
-        },
-      });
-
-    // Step 10: Return the thread message and output record
-    return res.json({
-      threadMessage,
-      output: outputRecord,
-      tokensUsed: totalTokens,
-      cost: agentResult.cost,
-    });
+    return res.json({ threadMessage, output: outputRecord, tokensUsed: totalTokens, cost: agentResult.cost });
   } catch (err) {
     console.error('[POST /tasks/:id/run]', err.message);
-
-    // Mark task as failed on error
-    await supabaseAdmin
-      .from('tasks')
-      .update({ status: 'failed' })
-      .eq('id', taskId)
-      .catch(() => {}); // Don't throw if this update also fails
-
+    await pool.query('UPDATE tasks SET status = $1 WHERE id = $2', ['failed', taskId]).catch(() => {});
     return res.status(500).json({ error: err.message });
   }
 });
-
-// ─── Helper: Build report message content ────────────────────────────────────
-
-/**
- * Builds the markdown content for the thread message report card.
- */
-function buildReportContent(task, agentResult) {
-  const fieldLines = agentResult.fields
-    .map(([k, v]) => `- **${k}**: ${v}`)
-    .join('\n');
-
-  return `## ${agentResult.label}
-
-**Task**: ${task.name}
-**Agent**: ${task.assigned_agent_type} Agent
-
-${fieldLines ? `### Summary\n${fieldLines}\n` : ''}
-### Output Preview
-${agentResult.content.slice(0, 1000)}${agentResult.content.length > 1000 ? '\n\n_[Full output available for download]_' : ''}`;
-}
-
-/**
- * Determines the message_type enum value from the agent's label.
- * Maps agent output labels to the thread_messages type enum.
- */
-function determineMessageType(label) {
-  const l = label.toLowerCase();
-  if (l.includes('report') || l.includes('findings') || l.includes('analysis') || l.includes('assessment')) {
-    return 'report';
-  }
-  if (l.includes('alert') || l.includes('warning') || l.includes('critical')) {
-    return 'alert';
-  }
-  if (l.includes('briefing')) {
-    return 'briefing';
-  }
-  return 'report';
-}
 
 module.exports = router;

@@ -1,91 +1,60 @@
 // ─── Outputs Router ───────────────────────────────────────────────────────────
-// Manages agent-generated file outputs stored in Supabase Storage.
-// Provides listing, signed-URL download generation, and deletion.
-//
 // Mounted at: /api/outputs
+// Files are served directly from the local filesystem via a download stream.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
+const pool    = require('../db');
 const { requireAuth } = require('../middleware/auth');
-const { getSupabaseForUser, supabaseAdmin } = require('../services/supabase');
-const { getSignedUrl, deleteOutput } = require('../services/storageService');
 
 const router = express.Router();
-
-// Apply auth middleware to all routes in this file
 router.use(requireAuth);
 
 // ─── GET /api/outputs ─────────────────────────────────────────────────────────
-// List outputs with optional filtering.
-// Query params: ?project_id=<uuid>&task_id=<uuid>&agent_id=<uuid>
-// At least one filter is required to prevent returning all outputs globally.
-// Returns outputs ordered by creation date (newest first).
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { project_id, task_id, agent_id } = req.query;
+    const { task_id } = req.query;
+    if (!task_id) return res.status(400).json({ error: 'task_id is required' });
 
-    if (!project_id && !task_id && !agent_id) {
-      return res.status(400).json({
-        error: 'At least one filter is required: project_id, task_id, or agent_id',
-      });
-    }
-
-    let query = supabase
-      .from('outputs')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (project_id) query = query.eq('project_id', project_id);
-    if (task_id) query = query.eq('task_id', task_id);
-    if (agent_id) query = query.eq('agent_id', agent_id);
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    return res.json(data);
+    const { rows } = await pool.query(
+      'SELECT * FROM outputs WHERE task_id = $1 ORDER BY created_at DESC',
+      [task_id]
+    );
+    return res.json(rows);
   } catch (err) {
     console.error('[GET /outputs]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/outputs/:id/download ───────────────────────────────────────────
-// Generate a fresh signed URL for downloading the output file.
-// Signed URLs are valid for 1 hour (3600 seconds).
-// The URL is also cached in the output record's download_url field.
+// ─── GET /api/outputs/:id/download ────────────────────────────────────────────
+// Streams the file from disk with Content-Disposition: attachment.
 router.get('/:id/download', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
+    const { rows } = await pool.query(
+      `SELECT o.* FROM outputs o
+       LEFT JOIN tasks t ON t.id = o.task_id
+       LEFT JOIN milestones m ON m.id = t.milestone_id
+       LEFT JOIN projects p ON p.id = m.project_id
+       LEFT JOIN workspaces w ON w.id = p.workspace_id
+       WHERE o.id = $1 AND (w.user_id = $2 OR o.task_id IS NULL)`,
+      [req.params.id, req.user.id]
+    );
 
-    // Fetch the output record to get the storage path
-    const { data: output, error: fetchError } = await supabase
-      .from('outputs')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const output = rows[0];
+    if (!output) return res.status(404).json({ error: 'Output not found or access denied' });
 
-    if (fetchError || !output) {
-      return res.status(404).json({ error: 'Output not found or access denied' });
+    if (!fs.existsSync(output.filepath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
     }
 
-    // Generate a fresh signed URL (they expire, so always generate fresh)
-    const signedUrl = await getSignedUrl(output.storage_path);
+    res.setHeader('Content-Disposition', `attachment; filename="${output.filename}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
 
-    // Cache the signed URL in the DB for reference (optional convenience field)
-    await supabaseAdmin
-      .from('outputs')
-      .update({ download_url: signedUrl })
-      .eq('id', id);
-
-    return res.json({
-      url: signedUrl,
-      filename: output.filename,
-      file_type: output.file_type,
-      file_size: output.file_size,
-      expires_in: 3600, // seconds
-    });
+    const stream = fs.createReadStream(output.filepath);
+    stream.pipe(res);
   } catch (err) {
     console.error('[GET /outputs/:id/download]', err.message);
     return res.status(500).json({ error: err.message });
@@ -93,41 +62,24 @@ router.get('/:id/download', async (req, res) => {
 });
 
 // ─── DELETE /api/outputs/:id ──────────────────────────────────────────────────
-// Delete an output record and its associated file in Supabase Storage.
-// Silently tolerates storage deletion failures (the DB record is still removed).
 router.delete('/:id', async (req, res) => {
   try {
-    const supabase = getSupabaseForUser(req.token);
-    const { id } = req.params;
+    const { rows } = await pool.query(
+      `SELECT o.* FROM outputs o
+       LEFT JOIN tasks t ON t.id = o.task_id
+       LEFT JOIN milestones m ON m.id = t.milestone_id
+       LEFT JOIN projects p ON p.id = m.project_id
+       LEFT JOIN workspaces w ON w.id = p.workspace_id
+       WHERE o.id = $1 AND (w.user_id = $2 OR o.task_id IS NULL)`,
+      [req.params.id, req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Output not found or access denied' });
 
-    // Fetch the output to get the storage path before deleting
-    const { data: output, error: fetchError } = await supabase
-      .from('outputs')
-      .select('id, storage_path, filename')
-      .eq('id', id)
-      .single();
+    // Delete file from disk (best-effort)
+    try { if (fs.existsSync(rows[0].filepath)) fs.unlinkSync(rows[0].filepath); } catch (_) {}
 
-    if (fetchError || !output) {
-      return res.status(404).json({ error: 'Output not found or access denied' });
-    }
-
-    // Delete the file from Supabase Storage (best-effort)
-    try {
-      await deleteOutput(output.storage_path);
-    } catch (storageErr) {
-      // Log but don't fail — the file may already be gone
-      console.warn('[DELETE /outputs/:id] Storage deletion failed (continuing):', storageErr.message);
-    }
-
-    // Delete the DB record
-    const { error: dbError } = await supabase
-      .from('outputs')
-      .delete()
-      .eq('id', id);
-
-    if (dbError) throw dbError;
-
-    return res.json({ success: true, message: `Output "${output.filename}" deleted` });
+    await pool.query('DELETE FROM outputs WHERE id = $1', [req.params.id]);
+    return res.json({ success: true });
   } catch (err) {
     console.error('[DELETE /outputs/:id]', err.message);
     return res.status(500).json({ error: err.message });
