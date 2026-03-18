@@ -12,6 +12,7 @@ const { runSubAgent }          = require('../services/anthropic');
 const redis                    = require('../services/redis');
 const { createTokenBudgetGuard } = require('../middleware/tokenBudget');
 const { addTokenUsage }          = require('../services/tokenTracker');
+const { sanitizeFilename, validateUploadPath, checkUserQuota } = require('../services/fileManager');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -172,22 +173,30 @@ router.post('/:id/run', agentBudgetGuard, async (req, res) => {
       agentName: agent.name,
     };
 
-    const filename = output_filename || `${(agent.name || 'agent').toLowerCase().replace(/\s+/g,'-')}-${Date.now()}.md`;
+    const rawFilename = output_filename || `${(agent.name || 'agent').toLowerCase().replace(/\s+/g,'-')}-${Date.now()}.md`;
+    const filename    = sanitizeFilename(rawFilename);
+
+    // Early quota gate (just checks the user has space at all)
+    await checkUserQuota(userId, 0);
 
     const agentResult = await runSubAgent(agent.name, task_description.trim(), projectContext, filename);
 
-    // Save to disk
-    const outputDir = path.join(UPLOADS_ROOT, userId, agent.project_id);
-    fs.mkdirSync(outputDir, { recursive: true });
-    const filepath = path.join(outputDir, filename);
-    fs.writeFileSync(filepath, agentResult.fileContent, 'utf8');
+    // Definitive quota check after we know the actual file size
     const sizeKb = Math.ceil(Buffer.byteLength(agentResult.fileContent, 'utf8') / 1024);
+    await checkUserQuota(userId, sizeKb);
+
+    // Save to disk
+    const outputDir   = path.join(UPLOADS_ROOT, userId, agent.project_id);
+    fs.mkdirSync(outputDir, { recursive: true });
+    const rawFilepath = path.join(outputDir, filename);
+    const filepath    = validateUploadPath(rawFilepath);
+    fs.writeFileSync(filepath, agentResult.fileContent, 'utf8');
 
     // Output record (no task_id for ad-hoc agent runs)
     const { rows: outRows } = await pool.query(
-      `INSERT INTO outputs (agent, filename, filepath, size_kb)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [agent.name, filename, filepath, sizeKb]
+      `INSERT INTO outputs (agent, filename, filepath, size_kb, user_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [agent.name, filename, filepath, sizeKb, userId]
     );
     const outputRecord = outRows[0];
 

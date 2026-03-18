@@ -14,6 +14,8 @@ const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
 const { runMigrations } = require('./migrations/run');
 
+const { cleanupOrphanFiles } = require('./services/fileManager');
+
 // ─── Route Handlers ───────────────────────────────────────────────────────────
 const authRouter          = require('./routes/auth');
 const workspacesRouter    = require('./routes/workspaces');
@@ -109,6 +111,8 @@ async function start() {
   // Run DB migrations before accepting traffic
   await runMigrations();
 
+  scheduleOrphanCleanup();
+
   app.listen(PORT, () => {
     console.log('');
     console.log('  ╔═══════════════════════════════════════════╗');
@@ -131,6 +135,25 @@ async function start() {
       console.log('  Environment variables: OK\n');
     }
   });
+}
+
+// ─── Orphan-file Cleanup (runs every 6 hours) ─────────────────────────────────
+const CLEANUP_INTERVAL_MS = parseInt(process.env.CLEANUP_INTERVAL_MS || '21600000', 10);
+
+function scheduleOrphanCleanup() {
+  setInterval(async () => {
+    console.log('[cleanup] Starting orphan-file scan…');
+    try {
+      const summary = await cleanupOrphanFiles();
+      console.log(
+        `[cleanup] Done — DB orphans removed: ${summary.dbOrphansRemoved}, ` +
+        `FS orphans removed: ${summary.fsOrphansRemoved}` +
+        (summary.errors.length ? `, errors: ${summary.errors.join('; ')}` : '')
+      );
+    } catch (err) {
+      console.error('[cleanup] Orphan scan failed:', err.message);
+    }
+  }, CLEANUP_INTERVAL_MS);
 }
 
 start().catch(err => {

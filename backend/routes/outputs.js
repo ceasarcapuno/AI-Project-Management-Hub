@@ -7,10 +7,23 @@ const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
 const pool    = require('../db');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth }    = require('../middleware/auth');
+const { validateUploadPath, getUserStorageStats } = require('../services/fileManager');
 
 const router = express.Router();
 router.use(requireAuth);
+
+// ─── GET /api/outputs/storage-usage ──────────────────────────────────────────
+// Returns the current user's storage usage and quota.
+router.get('/storage-usage', async (req, res) => {
+  try {
+    const stats = await getUserStorageStats(req.user.id);
+    return res.json(stats);
+  } catch (err) {
+    console.error('[GET /outputs/storage-usage]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // ─── GET /api/outputs ─────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
@@ -46,14 +59,22 @@ router.get('/:id/download', async (req, res) => {
     const output = rows[0];
     if (!output) return res.status(404).json({ error: 'Output not found or access denied' });
 
-    if (!fs.existsSync(output.filepath)) {
+    // Guard against any path-traversal stored in the DB
+    let safeFilepath;
+    try {
+      safeFilepath = validateUploadPath(output.filepath);
+    } catch (_) {
+      return res.status(400).json({ error: 'Invalid file path' });
+    }
+
+    if (!fs.existsSync(safeFilepath)) {
       return res.status(404).json({ error: 'File not found on disk' });
     }
 
     res.setHeader('Content-Disposition', `attachment; filename="${output.filename}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
 
-    const stream = fs.createReadStream(output.filepath);
+    const stream = fs.createReadStream(safeFilepath);
     stream.pipe(res);
   } catch (err) {
     console.error('[GET /outputs/:id/download]', err.message);

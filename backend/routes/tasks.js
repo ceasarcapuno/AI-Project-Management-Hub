@@ -12,6 +12,7 @@ const { runSubAgent }            = require('../services/anthropic');
 const redis                      = require('../services/redis');
 const { createTokenBudgetGuard } = require('../middleware/tokenBudget');
 const { addTokenUsage }          = require('../services/tokenTracker');
+const { sanitizeFilename, validateUploadPath, checkUserQuota } = require('../services/fileManager');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -174,23 +175,31 @@ router.post('/:id/run', taskBudgetGuard, async (req, res) => {
       taskName: task.name,
     };
 
-    const outputFilename = `${task.agent.toLowerCase()}-${task.name.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'')}-${Date.now()}.md`;
+    const rawFilename    = `${task.agent.toLowerCase()}-${task.name.toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9-]/g,'')}-${Date.now()}.md`;
+    const outputFilename = sanitizeFilename(rawFilename);
+
+    // Check that the user has space before invoking the model (early gate)
+    await checkUserQuota(userId, 0);
 
     // Run the AI agent
     const agentResult = await runSubAgent(task.agent, task.name, projectContext, outputFilename);
 
+    // Compute size and do the definitive quota check
+    const sizeKb = Math.ceil(Buffer.byteLength(agentResult.fileContent, 'utf8') / 1024);
+    await checkUserQuota(userId, sizeKb);
+
     // Save file to local filesystem
     const outputDir  = path.join(UPLOADS_ROOT, userId, task.project_id);
     fs.mkdirSync(outputDir, { recursive: true });
-    const filepath = path.join(outputDir, outputFilename);
+    const rawFilepath = path.join(outputDir, outputFilename);
+    const filepath    = validateUploadPath(rawFilepath);
     fs.writeFileSync(filepath, agentResult.fileContent, 'utf8');
-    const sizeKb = Math.ceil(Buffer.byteLength(agentResult.fileContent, 'utf8') / 1024);
 
     // Insert output record
     const { rows: outRows } = await pool.query(
-      `INSERT INTO outputs (task_id, agent, filename, filepath, size_kb)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [taskId, task.agent, outputFilename, filepath, sizeKb]
+      `INSERT INTO outputs (task_id, agent, filename, filepath, size_kb, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [taskId, task.agent, outputFilename, filepath, sizeKb, userId]
     );
     const outputRecord = outRows[0];
 
