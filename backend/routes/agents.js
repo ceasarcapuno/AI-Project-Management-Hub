@@ -7,12 +7,29 @@ const express = require('express');
 const fs      = require('fs');
 const path    = require('path');
 const pool    = require('../db');
-const { requireAuth } = require('../middleware/auth');
-const { runSubAgent } = require('../services/anthropic');
-const redis           = require('../services/redis');
+const { requireAuth }          = require('../middleware/auth');
+const { runSubAgent }          = require('../services/anthropic');
+const redis                    = require('../services/redis');
+const { createTokenBudgetGuard } = require('../middleware/tokenBudget');
+const { addTokenUsage }          = require('../services/tokenTracker');
 
 const router = express.Router();
 router.use(requireAuth);
+
+// ─── Token budget resolver for agent runs ────────────────────────────────────
+// Resolves the project that owns this agent so the budget guard can check it.
+const agentBudgetGuard = createTokenBudgetGuard(async (req) => {
+  const { rows } = await pool.query(
+    `SELECT a.project_id, w.user_id
+     FROM agents a
+     JOIN projects p  ON p.id = a.project_id
+     JOIN workspaces w ON w.id = p.workspace_id
+     WHERE a.id = $1`,
+    [req.params.id]
+  );
+  if (!rows[0]) throw new Error(`Agent ${req.params.id} not found`);
+  return { projectId: rows[0].project_id, userId: rows[0].user_id };
+});
 
 const UPLOADS_ROOT = process.env.UPLOADS_PATH || '/app/uploads';
 
@@ -118,7 +135,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // POST /api/agents/:id/run
-router.post('/:id/run', async (req, res) => {
+router.post('/:id/run', agentBudgetGuard, async (req, res) => {
   const userId = req.user.id;
   const { id: agentId } = req.params;
 
@@ -194,11 +211,12 @@ router.post('/:id/run', async (req, res) => {
       [agentResult.cost, agentId]
     );
 
-    // Update project totals
-    await pool.query(
-      `UPDATE projects SET token_used = token_used + $1, cost = cost + $2 WHERE id = $3`,
-      [totalTokens, agentResult.cost, agent.project_id]
-    );
+    // Update project totals + append agent_run audit row
+    await addTokenUsage(agent.project_id, agentId, {
+      inputTokens:  agentResult.inputTokens,
+      outputTokens: agentResult.outputTokens,
+      model:        agent.model || 'claude-sonnet-4-6',
+    });
 
     // Notification + Redis publish
     const { rows: notifRows } = await pool.query(

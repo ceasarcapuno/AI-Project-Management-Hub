@@ -5,7 +5,8 @@
 
 const express = require('express');
 const pool    = require('../db');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth }      = require('../middleware/auth');
+const { getProjectTokenUsage, getRemainingBudget, estimateCallCost } = require('../services/tokenTracker');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -132,6 +133,77 @@ router.put('/:id', async (req, res) => {
     return res.json(rows[0]);
   } catch (err) {
     console.error('[PUT /projects/:id]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/projects/:id/token-usage ───────────────────────────────────────
+router.get('/:id/token-usage', async (req, res) => {
+  try {
+    // Verify project belongs to user
+    const { rows: pRows } = await pool.query(
+      `SELECT p.id FROM projects p
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE p.id = $1 AND w.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (!pRows[0]) return res.status(404).json({ error: 'Project not found' });
+
+    const usage = await getProjectTokenUsage(req.params.id);
+
+    // Include per-run history (last 50)
+    const { rows: runs } = await pool.query(
+      `SELECT id, agent_id, task_id, tokens_total, cost, model, budget_enforced, created_at
+       FROM agent_runs WHERE project_id = $1
+       ORDER BY created_at DESC LIMIT 50`,
+      [req.params.id]
+    );
+
+    return res.json({ ...usage, runs });
+  } catch (err) {
+    console.error('[GET /projects/:id/token-usage]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/projects/:id/budget-status ─────────────────────────────────────
+router.get('/:id/budget-status', async (req, res) => {
+  try {
+    // Verify project belongs to user
+    const { rows: pRows } = await pool.query(
+      `SELECT p.id FROM projects p
+       JOIN workspaces w ON w.id = p.workspace_id
+       WHERE p.id = $1 AND w.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (!pRows[0]) return res.status(404).json({ error: 'Project not found' });
+
+    const budget = await getRemainingBudget(req.params.id);
+
+    // Determine health status label
+    let status = 'ok';
+    if (budget.isExceeded)       status = 'exceeded';
+    else if (budget.percentUsed >= 95) status = 'critical';
+    else if (budget.percentUsed >= 80) status = 'warning';
+
+    // Count blocked runs
+    const { rows: blockedRows } = await pool.query(
+      `SELECT COUNT(*) AS blocked_runs FROM agent_runs
+       WHERE project_id = $1 AND budget_enforced = TRUE`,
+      [req.params.id]
+    );
+
+    // Cost estimate for a typical 1 000-token call at default model
+    const estimate = estimateCallCost('claude-sonnet-4-6', 1000);
+
+    return res.json({
+      status,
+      ...budget,
+      blockedRuns:    parseInt(blockedRows[0].blocked_runs, 10),
+      costEstimate:   estimate,
+    });
+  } catch (err) {
+    console.error('[GET /projects/:id/budget-status]', err.message);
     return res.status(500).json({ error: err.message });
   }
 });

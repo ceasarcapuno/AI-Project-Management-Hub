@@ -49,6 +49,8 @@ Store the token as `AIPM_JWT_TOKEN` in your secrets. Token expiry is 7 days. To 
 | List agents | `GET /agents?project_id=<id>` |
 | Create agent | `POST /agents` |
 | Run agent ad-hoc | `POST /agents/:id/run` |
+| Get token usage detail | `GET /projects/:id/token-usage` |
+| Get budget health status | `GET /projects/:id/budget-status` |
 | Download output file | `GET /outputs/:id/download` |
 | Send chat message to project | `POST /chat/project/:projectId` |
 | Read project thread history | `GET /chat/project/:projectId/thread` |
@@ -373,6 +375,47 @@ DELETE /outputs/:id
 Auth: Bearer
 ```
 Removes both the database record and the file from disk.
+
+---
+
+### Token Budget
+
+#### Get token usage detail
+```
+GET /projects/:id/token-usage
+Auth: Bearer
+```
+Returns cumulative usage plus the last 50 per-run records:
+```json
+{
+  "tokenUsed": 145000,
+  "tokenLimit": 200000,
+  "cost": 2.34,
+  "percentUsed": 72.5,
+  "runs": [{ "id", "tokens_total", "cost", "model", "budget_enforced", "created_at" }]
+}
+```
+
+#### Get budget health status
+```
+GET /projects/:id/budget-status
+Auth: Bearer
+```
+```json
+{
+  "status": "warning",
+  "tokenUsed": 162000,
+  "tokenLimit": 200000,
+  "percentUsed": 81.0,
+  "remaining": 38000,
+  "isExceeded": false,
+  "blockedRuns": 0,
+  "costEstimate": { "estimatedCost": 0.0135, "model": "claude-sonnet-4-6" }
+}
+```
+`status` values: `ok` | `warning` (≥80%) | `critical` (≥95%) | `exceeded` (100%)
+
+**Token budget enforcement**: Agent and task run endpoints return HTTP `429` when the project has reached its `token_limit`. Real-time SSE warnings are sent at 80%, 95%, and 100% thresholds.
 
 ---
 
