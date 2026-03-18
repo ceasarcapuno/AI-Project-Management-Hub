@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- AIPM favicon: stylised AI PM monogram on warm accent background -->
+  <rect width="32" height="32" rx="8" fill="#d4692a"/>
+  <text x="4" y="22" font-family="Georgia, serif" font-weight="900" font-size="16" fill="white">AI</text>
+  <text x="4" y="30" font-family="Georgia, serif" font-weight="700" font-size="9" fill="rgba(255,255,255,0.8)">PM</text>
+</svg>
