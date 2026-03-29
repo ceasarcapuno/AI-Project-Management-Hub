@@ -23,10 +23,10 @@ git pull origin "$BRANCH"
 info "Rebuilding containers..."
 $COMPOSE up --build -d
 
-# 3. Verify health
+# 3. Verify health (run curl inside the container — port isn't exposed to host)
 info "Waiting for backend health..."
 for i in $(seq 1 20); do
-  if curl -sf http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+  if docker exec aipm-backend-1 wget -qO- http://localhost:3000/api/health >/dev/null 2>&1; then
     info "Backend is healthy."
     break
   fi
