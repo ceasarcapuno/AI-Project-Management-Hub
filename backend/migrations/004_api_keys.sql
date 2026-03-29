@@ -1,7 +1,7 @@
 -- 004_api_keys.sql — Persistent API keys for programmatic access (Maximus/OpenClaw)
 CREATE TABLE IF NOT EXISTS api_keys (
   id          SERIAL PRIMARY KEY,
-  user_id     INTEGER NOT NULL,
+  user_id     UUID NOT NULL,
   name        VARCHAR(255) NOT NULL,
   key_hash    VARCHAR(255) NOT NULL UNIQUE,
   key_prefix  VARCHAR(12)  NOT NULL,
