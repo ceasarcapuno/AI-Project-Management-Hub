@@ -116,4 +116,11 @@ export const chat = {
   getThread:     (projectId) => api.get(`/chat/project/${projectId}/thread`).then(r => r.data),
 }
 
+// ─── API Keys ─────────────────────────────────────────────────────────────────
+export const apiKeys = {
+  list:   ()         => api.get('/apikeys').then(r => r.data),
+  create: (name)     => api.post('/apikeys', { name }).then(r => r.data),
+  revoke: (id)       => api.delete(`/apikeys/${id}`).then(r => r.data),
+}
+
 export default api

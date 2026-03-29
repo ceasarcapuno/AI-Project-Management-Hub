@@ -1,12 +1,13 @@
 version: '3.9'
 
-# Production compose — Nginx runs on the VPS host (not in Docker).
-# Frontend is mapped to port 8080 so host Nginx can proxy to it.
-# Postgres and Redis are NOT exposed to the host network.
+# Production compose — NPM (nginx-proxy-manager) handles SSL + routing.
+# Backend and frontend join the external nginx-proxy network automatically
+# so NPM can reach them by container name after every rebuild.
 
 services:
   backend:
     build: ./backend
+    container_name: aipm-backend-1
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
@@ -18,8 +19,9 @@ services:
       PORT: 3000
     volumes:
       - uploads:/app/uploads
-    ports:
-      - "127.0.0.1:3000:3000"   # only reachable from localhost (Nginx proxies /api)
+    networks:
+      - aipm_default
+      - nginx-proxy
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,8 +39,10 @@ services:
       context: ./frontend
       args:
         VITE_API_URL: /api
-    ports:
-      - "127.0.0.1:8080:80"     # only reachable from localhost (Nginx proxies /)
+    container_name: aipm-frontend-1
+    networks:
+      - aipm_default
+      - nginx-proxy
     depends_on:
       backend:
         condition: service_healthy
@@ -46,13 +50,15 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    container_name: aipm-postgres-1
     environment:
       POSTGRES_DB: aipm
       POSTGRES_USER: aipm_user
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # No host port — only reachable inside Docker network
+    networks:
+      - aipm_default
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aipm_user -d aipm"]
@@ -62,10 +68,12 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: aipm-redis-1
     command: redis-server --appendonly yes
     volumes:
       - redisdata:/data
-    # No host port — only reachable inside Docker network
+    networks:
+      - aipm_default
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -77,3 +85,9 @@ volumes:
   uploads:
   pgdata:
   redisdata:
+
+networks:
+  aipm_default:
+    driver: bridge
+  nginx-proxy:
+    external: true   # pre-existing network created by nginx-proxy-manager

@@ -1,34 +1,59 @@
-// ─── JWT Authentication Middleware ────────────────────────────────────────────
-// Verifies a JWT Bearer token signed with JWT_SECRET.
+// ─── Authentication Middleware ─────────────────────────────────────────────────
+// Supports two methods:
+//   1. JWT Bearer token  — Authorization: Bearer <jwt>
+//   2. API Key           — X-API-Key: aipm_<key>  (persistent, never expires)
 // On success: attaches req.user = { id, email, name } to the request.
-// On failure: returns 401 Unauthorized.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const jwt = require('jsonwebtoken');
+const jwt    = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const pool   = require('../db');
 
 async function requireAuth(req, res, next) {
   try {
-    const authHeader = req.headers.authorization;
+    // ── Method 1: API Key via X-API-Key header ──────────────────────────────
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey && apiKey.startsWith('aipm_')) {
+      const { rows } = await pool.query(
+        `SELECT ak.id, ak.key_hash, ak.user_id,
+                u.email, u.name
+         FROM api_keys ak
+         JOIN users u ON u.id = ak.user_id
+         WHERE ak.key_prefix = $1`,
+        [apiKey.slice(0, 12)]
+      );
 
+      for (const row of rows) {
+        const match = await bcrypt.compare(apiKey, row.key_hash);
+        if (match) {
+          // Update last_used (fire and forget)
+          pool.query('UPDATE api_keys SET last_used = NOW() WHERE id = $1', [row.id])
+            .catch(() => {});
+          req.user = { id: row.user_id, email: row.email, name: row.name };
+          return next();
+        }
+      }
+      return res.status(401).json({ error: 'Unauthorised', message: 'Invalid API key' });
+    }
+
+    // ── Method 2: JWT Bearer token ──────────────────────────────────────────
+    const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         error: 'Unauthorised',
-        message: 'Missing or malformed Authorization header. Expected: Bearer <token>',
+        message: 'Provide Authorization: Bearer <jwt>  or  X-API-Key: aipm_<key>',
       });
     }
 
     const token = authHeader.slice(7).trim();
-
     if (!token) {
       return res.status(401).json({ error: 'Unauthorised', message: 'Bearer token is empty' });
     }
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Attach minimal user object — all routes use req.user.id to scope queries
     req.user = { id: payload.sub, email: payload.email, name: payload.name };
-
     return next();
+
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
       return res.status(401).json({ error: 'Unauthorised', message: 'Token has expired' });
@@ -37,7 +62,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Unauthorised', message: 'Invalid token' });
     }
     console.error('[requireAuth] Unexpected error:', err.message);
-    return res.status(500).json({ error: 'Internal Server Error', message: 'Authentication check failed' });
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
 

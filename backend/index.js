@@ -26,6 +26,7 @@ const agentsRouter        = require('./routes/agents');
 const notificationsRouter = require('./routes/notifications');
 const outputsRouter       = require('./routes/outputs');
 const chatRouter          = require('./routes/chat');
+const apiKeysRouter       = require('./routes/apikeys');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +89,7 @@ app.use('/api/agents',        agentsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/outputs',       outputsRouter);
 app.use('/api/chat',          chatRouter);
+app.use('/api/apikeys',       apiKeysRouter);
 
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 app.use('/api/*', (req, res) => {
