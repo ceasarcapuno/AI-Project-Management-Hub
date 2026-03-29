@@ -7,8 +7,7 @@
 // Manage: sudo systemctl start aipm-claude-runner
 // ─────────────────────────────────────────────────────────────────────────────
 
-require('dotenv').config({ path: '/opt/aipm/.env' });
-
+// env vars are injected by systemd EnvironmentFile=/opt/aipm/.env
 const http     = require('http');
 const { execFile } = require('child_process');
 
