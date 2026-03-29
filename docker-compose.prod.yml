@@ -1,0 +1,95 @@
+version: '3.9'
+
+# Production compose — NPM (nginx-proxy-manager) handles SSL + routing.
+# Backend and frontend join the external nginx-proxy network automatically
+# so NPM can reach them by container name after every rebuild.
+
+services:
+  backend:
+    build: ./backend
+    container_name: aipm-backend-1
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      NODE_ENV: production
+      UPLOADS_PATH: /app/uploads
+      FRONTEND_URL: ${FRONTEND_URL}
+      PORT: 3000
+    volumes:
+      - uploads:/app/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach claude-runner on host port 3001
+    networks:
+      - aipm_default
+      - nginx-proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api
+    container_name: aipm-frontend-1
+    networks:
+      - aipm_default
+      - nginx-proxy
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aipm-postgres-1
+    environment:
+      POSTGRES_DB: aipm
+      POSTGRES_USER: aipm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - aipm_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aipm_user -d aipm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: aipm-redis-1
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    networks:
+      - aipm_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  uploads:
+  pgdata:
+  redisdata:
+
+networks:
+  aipm_default:
+    driver: bridge
+  nginx-proxy:
+    external: true   # pre-existing network created by nginx-proxy-manager

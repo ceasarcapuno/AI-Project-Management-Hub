@@ -36,9 +36,10 @@ api.interceptors.response.use(
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 export const auth = {
-  register: (data) => api.post('/auth/register', data).then(r => r.data),
-  login:    (data) => api.post('/auth/login',    data).then(r => r.data),
-  me:       ()     => api.get('/auth/me').then(r => r.data),
+  register:    (data) => api.post('/auth/register', data).then(r => r.data),
+  login:       (data) => api.post('/auth/login',    data).then(r => r.data),
+  me:          ()     => api.get('/auth/me').then(r => r.data),
+  generateToken: ()   => api.post('/auth/token').then(r => r.data),
 }
 
 // ─── Workspaces ──────────────────────────────────────────────────────────────
@@ -113,6 +114,13 @@ export const chat = {
   sendToProject: (projectId, message, history = []) =>
     api.post(`/chat/project/${projectId}`, { message, history }).then(r => r.data),
   getThread:     (projectId) => api.get(`/chat/project/${projectId}/thread`).then(r => r.data),
+}
+
+// ─── API Keys ─────────────────────────────────────────────────────────────────
+export const apiKeys = {
+  list:   ()         => api.get('/apikeys').then(r => r.data),
+  create: (name)     => api.post('/apikeys', { name }).then(r => r.data),
+  revoke: (id)       => api.delete(`/apikeys/${id}`).then(r => r.data),
 }
 
 export default api

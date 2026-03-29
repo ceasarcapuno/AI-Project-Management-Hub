@@ -26,6 +26,8 @@ const agentsRouter        = require('./routes/agents');
 const notificationsRouter = require('./routes/notifications');
 const outputsRouter       = require('./routes/outputs');
 const chatRouter          = require('./routes/chat');
+const apiKeysRouter       = require('./routes/apikeys');
+const claudeTasksRouter   = require('./routes/claudeTasks');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -45,7 +47,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
 
 // ─── Body Parsing ─────────────────────────────────────────────────────────────
@@ -88,6 +90,8 @@ app.use('/api/agents',        agentsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/outputs',       outputsRouter);
 app.use('/api/chat',          chatRouter);
+app.use('/api/apikeys',       apiKeysRouter);
+app.use('/api/claude-tasks', claudeTasksRouter);
 
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 app.use('/api/*', (req, res) => {

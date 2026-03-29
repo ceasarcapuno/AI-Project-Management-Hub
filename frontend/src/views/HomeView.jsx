@@ -4,8 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import React, { useMemo } from 'react'
-import { T, WS, TASK_STATUS } from '../../utils/constants'
-import { pct, fmtDueDate } from '../../utils/helpers'
+import { T, WS, TASK_STATUS } from '../utils/constants'
+import { pct, fmtDueDate } from '../utils/helpers'
 
 // ─── Stat card ────────────────────────────────────────────────────────────────
 function StatCard({ icon, label, value, sub, color, bg }) {
