@@ -1,0 +1,23 @@
+[Unit]
+Description=AIPM Claude Code Runner
+Documentation=https://github.com/ceasarcapuno/AI-Project-Management-Hub
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/aipm
+ExecStart=/usr/bin/node /opt/aipm/claude-runner.js
+Restart=always
+RestartSec=5
+
+# Load ANTHROPIC_API_KEY and other vars from .env
+EnvironmentFile=/opt/aipm/.env
+
+# Output to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aipm-claude-runner
+
+[Install]
+WantedBy=multi-user.target

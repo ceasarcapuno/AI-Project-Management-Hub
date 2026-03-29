@@ -19,6 +19,8 @@ services:
       PORT: 3000
     volumes:
       - uploads:/app/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach claude-runner on host port 3001
     networks:
       - aipm_default
       - nginx-proxy
