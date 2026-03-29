@@ -36,9 +36,10 @@ api.interceptors.response.use(
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 export const auth = {
-  register: (data) => api.post('/auth/register', data).then(r => r.data),
-  login:    (data) => api.post('/auth/login',    data).then(r => r.data),
-  me:       ()     => api.get('/auth/me').then(r => r.data),
+  register:    (data) => api.post('/auth/register', data).then(r => r.data),
+  login:       (data) => api.post('/auth/login',    data).then(r => r.data),
+  me:          ()     => api.get('/auth/me').then(r => r.data),
+  generateToken: ()   => api.post('/auth/token').then(r => r.data),
 }
 
 // ─── Workspaces ──────────────────────────────────────────────────────────────

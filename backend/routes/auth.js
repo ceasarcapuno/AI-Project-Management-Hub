@@ -90,6 +90,23 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/token ─────────────────────────────────────────────────────
+// Generate a fresh JWT for the currently authenticated user (for API access)
+router.post('/token', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, email, name FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    const token = signToken(rows[0]);
+    return res.json({ token, expires_in: '7d' });
+  } catch (err) {
+    console.error('[POST /auth/token]', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── GET /api/auth/me ──────────────────────────────────────────────────────────
 router.get('/me', requireAuth, async (req, res) => {
   try {

@@ -13,6 +13,7 @@ import AIPMChatBar    from '../components/layout/AIPMChatBar'
 import HomeView       from '../views/HomeView'
 import ProjectDetail  from '../components/project/ProjectDetail'
 import NotificationPanel from '../components/notifications/NotificationPanel'
+import Settings       from './Settings'
 
 export default function Dashboard() {
   const {
@@ -27,6 +28,7 @@ export default function Dashboard() {
   // ── Layout state ────────────────────────────────────────────────────────
   const [sidebarOpen,  setSidebarOpen]  = useState(true)
   const [showNotifs,   setShowNotifs]   = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const [isMobile,     setIsMobile]     = useState(window.innerWidth < 768)
   const [isTablet,     setIsTablet]     = useState(window.innerWidth < 1024)
 
@@ -171,8 +173,10 @@ export default function Dashboard() {
         isMobile={isMobile}
         isTablet={isTablet}
         isDesktop={!isTablet}
-        activeWs={activeWorkspace?.type}
+        activeWs={showSettings ? 'settings' : activeWorkspace?.type}
         setActiveWs={(wsType) => {
+          if (wsType === 'settings') { setShowSettings(true); return }
+          setShowSettings(false)
           const ws = workspaces.find(w => w.type === wsType)
           if (ws) setActiveWorkspace(ws)
         }}
@@ -249,6 +253,9 @@ export default function Dashboard() {
         {/* AIPM Chat bar */}
         <AIPMChatBar projectId={activeProject?.id ?? null} />
       </div>
+
+      {/* Settings modal */}
+      {showSettings && <Settings onClose={() => setShowSettings(false)} />}
     </div>
   )
 }

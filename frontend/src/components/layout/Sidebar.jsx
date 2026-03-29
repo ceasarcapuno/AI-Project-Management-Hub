@@ -254,6 +254,15 @@ export default function Sidebar({
           active={activeWs === 'team'}
           onClick={() => setActiveWs('team')}
         />
+
+        {/* Settings */}
+        <NavItem
+          icon="⚙️"
+          label="Settings"
+          open={open}
+          active={activeWs === 'settings'}
+          onClick={() => setActiveWs('settings')}
+        />
       </nav>
 
       {/* ── Cost footer ───────────────────────────────────────────────── */}
