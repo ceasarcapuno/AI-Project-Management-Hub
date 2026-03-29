@@ -1,6 +1,6 @@
 // ─── AIPM Claude Code Runner ───────────────────────────────────────────────────
 // Runs on the HOST (not inside Docker) so it has git + docker compose access.
-// Listens on 127.0.0.1:3001 — only reachable from the backend container via
+// Listens on 0.0.0.0:3001 — only reachable from the backend container via
 // host.docker.internal, never exposed to the internet directly.
 //
 // Start:  node /opt/aipm/claude-runner.js
@@ -105,8 +105,8 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[claude-runner] Listening on 127.0.0.1:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[claude-runner] Listening on 0.0.0.0:${PORT}`);
   console.log(`[claude-runner] Repo: ${REPO_DIR}`);
   console.log(`[claude-runner] ANTHROPIC_API_KEY: ${process.env.ANTHROPIC_API_KEY ? 'set' : 'MISSING'}`);
 });
